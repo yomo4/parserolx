@@ -104,12 +104,19 @@ class OLXParser:
         return quote(normalized, safe="")
 
     def _build_search_url(self, query: str, page: int, category_path: str = "") -> str:
-        slug = self._build_search_slug(query)
         normalized_path = category_path.strip("/")
-        if normalized_path:
-            url = f"{self.BASE_URL}/{normalized_path}/q-{slug}/"
+        cleaned_query = query.strip()
+        if cleaned_query:
+            slug = self._build_search_slug(cleaned_query)
+            if normalized_path:
+                url = f"{self.BASE_URL}/{normalized_path}/q-{slug}/"
+            else:
+                url = self.SEARCH_URL.format(query=slug)
         else:
-            url = self.SEARCH_URL.format(query=slug)
+            if normalized_path:
+                url = f"{self.BASE_URL}/{normalized_path}/"
+            else:
+                url = f"{self.BASE_URL}/oferte/"
         if page > 1:
             url += f"?page={page}"
         return url

@@ -72,6 +72,7 @@ ADMIN_CODE_DURATIONS = (7, 30, 90, 365)
 
 
 class SearchState(StatesGroup):
+    waiting_mode = State()
     waiting_query = State()
     configuring_search = State()
 
@@ -180,6 +181,18 @@ def _build_admin_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _build_search_entry_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔎 По запросу", callback_data="searchmode:query"),
+                InlineKeyboardButton(text="🗂 Только категория", callback_data="searchmode:category"),
+            ],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")],
+        ]
+    )
+
+
 def _home_text(user_id: int) -> str:
     user = db.get_user(user_id) or {}
     username = f"@{user['username']}" if user.get("username") else "не указан"
@@ -257,6 +270,28 @@ def _subscription_required_text() -> str:
     )
 
 
+def _search_mode_label(search_mode: str) -> str:
+    return "только категория" if search_mode == "category_only" else "по запросу"
+
+
+def _display_query(query: str, settings: dict) -> str:
+    if settings.get("search_mode") == "category_only":
+        return "не используется"
+    cleaned = query.strip()
+    return cleaned if cleaned else "не задан"
+
+
+def _search_target_text(query: str, settings: dict) -> str:
+    category_label = CATEGORY_OPTIONS[settings["category_key"]]["label"]
+    if settings.get("search_mode") == "category_only":
+        return f"категория {category_label}"
+    return query
+
+
+def _normalize_query_for_search(query: str, settings: dict) -> str:
+    return "" if settings.get("search_mode") == "category_only" else query.strip()
+
+
 def _extract_settings(data: dict) -> dict:
     category_key = str(data.get("category_key", "all"))
     if category_key not in CATEGORY_OPTIONS:
@@ -264,7 +299,11 @@ def _extract_settings(data: dict) -> dict:
     review_filter = str(data.get("review_filter", "any"))
     if review_filter not in REVIEW_FILTER_LABELS:
         review_filter = "any"
+    search_mode = str(data.get("search_mode", "query"))
+    if search_mode not in {"query", "category_only"}:
+        search_mode = "query"
     return {
+        "search_mode": search_mode,
         "category_key": category_key,
         "max_check": int(data.get("max_check", config.MAX_LISTINGS_CHECK)),
         "max_pages": int(data.get("max_pages", config.MAX_PAGES)),
@@ -275,7 +314,8 @@ def _extract_settings(data: dict) -> dict:
 def _build_settings_text(query: str, settings: dict) -> str:
     return (
         "⚙️ <b>Настройки парсинга</b>\n\n"
-        f"Запрос: <code>{escape(query)}</code>\n"
+        f"Режим: <b>{_search_mode_label(settings['search_mode'])}</b>\n"
+        f"Запрос: <code>{escape(_display_query(query, settings))}</code>\n"
         f"Категория: <b>{CATEGORY_OPTIONS[settings['category_key']]['label']}</b>\n"
         f"Объявлений на проверку: <b>{settings['max_check']}</b>\n"
         f"Страниц поиска: <b>{settings['max_pages']}</b>\n"
@@ -289,6 +329,16 @@ def _build_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
         return f"✅ {label}" if selected else label
 
     rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text=mark(settings["search_mode"] == "query", "По запросу"),
+                callback_data="cfg:mode:query",
+            ),
+            InlineKeyboardButton(
+                text=mark(settings["search_mode"] == "category_only", "Только категория"),
+                callback_data="cfg:mode:category_only",
+            ),
+        ],
         [
             InlineKeyboardButton(
                 text=mark(settings["category_key"] == "all", CATEGORY_OPTIONS["all"]["label"]),
@@ -391,8 +441,9 @@ async def cmd_help(message: Message, state: FSMContext) -> None:
         "1. Откройте профиль или раздел подписки\n"
         "2. Активируйте код подписки\n"
         "3. Нажмите «Начать парс»\n"
-        "4. Введите запрос и настройте категорию, страницы, количество объявлений и фильтр отзывов\n"
-        "5. Бот соберет объявления и покажет только подходящие результаты\n\n"
+        "4. Выберите режим: по запросу или только по категории\n"
+        "5. Настройте категорию, страницы, количество объявлений и фильтр отзывов\n"
+        "6. Запустите поиск\n\n"
         f"{hbold('Важно по фильтру отзывов:')}\n"
         "• «с отзывами» пропускает только продавцов с подтвержденным количеством отзывов > 0\n"
         "• «без отзывов» пропускает только продавцов, где явно найдено 0 отзывов\n"
@@ -429,8 +480,13 @@ async def cmd_search(message: Message, state: FSMContext) -> None:
             reply_markup=_build_subscription_keyboard(message.from_user.id),
         )
         return
-    await state.set_state(SearchState.waiting_query)
-    await message.answer("🔎 Введите поисковый запрос:")
+    await state.set_state(SearchState.waiting_mode)
+    await message.answer(
+        "Выберите режим парсинга:\n"
+        "• по запросу\n"
+        "• только по выбранной категории",
+        reply_markup=_build_search_entry_keyboard(),
+    )
 
 
 @dp.message(Command("admin"))
@@ -507,8 +563,13 @@ async def handle_menu_callback(callback: CallbackQuery, state: FSMContext) -> No
             )
             await callback.answer("Нужна активная подписка", show_alert=True)
             return
-        await state.set_state(SearchState.waiting_query)
-        await callback.message.answer("🔎 Введите поисковый запрос:")
+        await state.set_state(SearchState.waiting_mode)
+        await callback.message.answer(
+            "Выберите режим парсинга:\n"
+            "• по запросу\n"
+            "• только по выбранной категории",
+            reply_markup=_build_search_entry_keyboard(),
+        )
         await callback.answer()
         return
 
@@ -522,6 +583,38 @@ async def handle_menu_callback(callback: CallbackQuery, state: FSMContext) -> No
             _build_admin_keyboard(),
         )
         await callback.answer()
+        return
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("searchmode:"))
+async def handle_search_mode_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+
+    _sync_user(callback.from_user)
+    if not _has_access(callback.from_user.id):
+        await state.clear()
+        await _show_panel(
+            callback.message,
+            _subscription_required_text(),
+            _build_subscription_keyboard(callback.from_user.id),
+        )
+        await callback.answer("Нужна активная подписка", show_alert=True)
+        return
+
+    mode = callback.data.split(":", maxsplit=1)[1]
+    if mode == "query":
+        await state.set_state(SearchState.waiting_query)
+        await callback.message.answer("🔎 Введите поисковый запрос:")
+        await callback.answer()
+        return
+
+    if mode == "category":
+        await _open_search_settings(callback.message, state, "", search_mode="category_only")
+        await callback.answer("Выберите категорию и запустите парсинг")
         return
 
     await callback.answer()
@@ -645,6 +738,20 @@ async def handle_subscription_code(message: Message, state: FSMContext) -> None:
     )
 
 
+@dp.message(SearchState.waiting_mode, F.text & ~F.text.startswith("/"))
+async def handle_search_mode_text(message: Message, state: FSMContext) -> None:
+    _sync_user(message.from_user)
+    if not _has_access(message.from_user.id):
+        await state.clear()
+        await message.answer(
+            _subscription_required_text(),
+            parse_mode="HTML",
+            reply_markup=_build_subscription_keyboard(message.from_user.id),
+        )
+        return
+    await _open_search_settings(message, state, (message.text or "").strip(), search_mode="query")
+
+
 @dp.message(SearchState.waiting_query, F.text & ~F.text.startswith("/"))
 async def handle_search_state(message: Message, state: FSMContext) -> None:
     _sync_user(message.from_user)
@@ -656,7 +763,7 @@ async def handle_search_state(message: Message, state: FSMContext) -> None:
             reply_markup=_build_subscription_keyboard(message.from_user.id),
         )
         return
-    await _open_search_settings(message, state, (message.text or "").strip())
+    await _open_search_settings(message, state, (message.text or "").strip(), search_mode="query")
 
 
 @dp.message(SearchState.configuring_search, F.text & ~F.text.startswith("/"))
@@ -670,7 +777,7 @@ async def handle_new_query_during_config(message: Message, state: FSMContext) ->
             reply_markup=_build_subscription_keyboard(message.from_user.id),
         )
         return
-    await _open_search_settings(message, state, (message.text or "").strip())
+    await _open_search_settings(message, state, (message.text or "").strip(), search_mode="query")
 
 
 @dp.message(StateFilter(None), F.text & ~F.text.startswith("/"))
@@ -683,7 +790,7 @@ async def handle_text(message: Message, state: FSMContext) -> None:
             reply_markup=_build_subscription_keyboard(message.from_user.id),
         )
         return
-    await _open_search_settings(message, state, (message.text or "").strip())
+    await _open_search_settings(message, state, (message.text or "").strip(), search_mode="query")
 
 
 @dp.callback_query(F.data.startswith("cfg:"))
@@ -699,8 +806,10 @@ async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> 
         return
 
     data = await state.get_data()
-    query = data.get("query", "")
-    if not query:
+    settings = _extract_settings(data)
+    query = str(data.get("query", ""))
+    normalized_query = _normalize_query_for_search(query, settings)
+    if settings["search_mode"] == "query" and not normalized_query:
         await state.clear()
         await callback.answer("Запрос не найден. Отправьте его заново.", show_alert=True)
         return
@@ -730,11 +839,18 @@ async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> 
             return
 
         settings = _extract_settings(data)
+        normalized_query = _normalize_query_for_search(query, settings)
+        if settings["search_mode"] == "query" and len(normalized_query) < 2:
+            await callback.answer("Введите запрос минимум из 2 символов.", show_alert=True)
+            return
+        if settings["search_mode"] == "category_only" and settings["category_key"] == "all":
+            await callback.answer("Для режима по категории выберите конкретную категорию.", show_alert=True)
+            return
         logger.info(
             "[UI] Search started | chat=%s | user=%s | query=%r | settings=%s",
             callback.message.chat.id,
             callback.from_user.id,
-            query,
+            normalized_query,
             settings,
         )
         await state.clear()
@@ -743,10 +859,19 @@ async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> 
         except Exception:
             pass
         await callback.answer("Запускаю парсинг...")
-        await run_search(callback.message, callback.from_user.id, query, settings)
+        await run_search(callback.message, callback.from_user.id, normalized_query, settings)
         return
 
-    if action == "check" and len(parts) == 3:
+    if action == "mode" and len(parts) == 3:
+        new_mode = parts[2]
+        if new_mode == "query":
+            await state.update_data(search_mode="query")
+        elif new_mode == "category_only":
+            await state.update_data(search_mode="category_only", query="")
+        else:
+            await callback.answer()
+            return
+    elif action == "check" and len(parts) == 3:
         await state.update_data(max_check=int(parts[2]))
     elif action == "pages" and len(parts) == 3:
         await state.update_data(max_pages=int(parts[2]))
@@ -760,6 +885,7 @@ async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> 
 
     updated_data = await state.get_data()
     settings = _extract_settings(updated_data)
+    query = str(updated_data.get("query", ""))
     logger.info(
         "[UI] Settings updated | chat=%s | user=%s | query=%r | settings=%s",
         callback.message.chat.id,
@@ -776,12 +902,21 @@ async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> 
     await callback.answer("Настройки обновлены")
 
 
-async def _open_search_settings(message: Message, state: FSMContext, query: str) -> None:
-    if len(query) < 2:
+async def _open_search_settings(
+    message: Message,
+    state: FSMContext,
+    query: str,
+    search_mode: Optional[str] = None,
+) -> None:
+    existing = await state.get_data()
+    effective_mode = search_mode or str(existing.get("search_mode", "query"))
+
+    if effective_mode == "query" and len(query.strip()) < 2:
         await message.answer("❗ Запрос слишком короткий. Введите минимум 2 символа.")
         return
+    if effective_mode == "category_only":
+        query = ""
 
-    existing = await state.get_data()
     old_message_id = existing.get("settings_message_id")
     if old_message_id:
         try:
@@ -790,6 +925,7 @@ async def _open_search_settings(message: Message, state: FSMContext, query: str)
             pass
 
     settings = {
+        "search_mode": effective_mode,
         "category_key": existing.get("category_key", "all"),
         "max_check": existing.get("max_check", config.MAX_LISTINGS_CHECK),
         "max_pages": existing.get("max_pages", config.MAX_PAGES),
@@ -816,7 +952,7 @@ async def _open_search_settings(message: Message, state: FSMContext, query: str)
 
 
 async def run_search(message: Message, requester_id: int, query: str, settings: dict) -> None:
-    db.record_search(requester_id, query)
+    db.record_search(requester_id, _search_target_text(query, settings))
 
     status_msg = await message.answer(
         _build_status_text(query, settings),
@@ -886,7 +1022,7 @@ async def _show_search_result(
             parse_mode="HTML",
         )
         await message.answer(
-            f"😔 По запросу {hbold(query)} ничего не найдено.\n"
+            f"😔 Для {hbold(_search_target_text(query, settings))} ничего не найдено.\n"
             f"Категория: {hbold(CATEGORY_OPTIONS[settings['category_key']]['label'])}\n"
             f"Фильтр по отзывам: {hbold(REVIEW_FILTER_LABELS[settings['review_filter']])}",
             parse_mode="HTML",
@@ -931,10 +1067,11 @@ async def _show_search_result(
 
 def _build_status_text(query: str, settings: dict, progress: dict | None = None) -> str:
     lines = [
-        f"🔌 Ищу: {hbold(query)}",
+        f"🔌 Ищу: {hbold(_search_target_text(query, settings))}",
         (
             f"⚙️ До {settings['max_check']} объявлений, "
             f"{settings['max_pages']} стр., "
+            f"режим: {_search_mode_label(settings['search_mode'])}, "
             f"категория: {CATEGORY_OPTIONS[settings['category_key']]['label']}, "
             f"отзывы: {REVIEW_FILTER_LABELS[settings['review_filter']]}"
         ),
@@ -962,7 +1099,8 @@ def _build_status_text(query: str, settings: dict, progress: dict | None = None)
 
 def _build_completion_text(query: str, settings: dict, stats, found: int) -> str:
     lines = [
-        f"✅ Поиск завершен: {hbold(query)}",
+        f"✅ Поиск завершен: {hbold(_search_target_text(query, settings))}",
+        f"🧭 Режим: {_search_mode_label(settings['search_mode'])}",
         f"🗂 Категория: {CATEGORY_OPTIONS[settings['category_key']]['label']}",
         f"🔎 Проверено объявлений: {stats.listings_checked}",
         f"📄 Страниц поиска: {stats.pages_loaded}",
