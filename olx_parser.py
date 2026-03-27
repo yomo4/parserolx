@@ -899,12 +899,21 @@ class OLXParser:
         review_filter: str,
         seller_rating: Optional[str] = None,
         has_no_reviews_signal: bool = False,
+        has_review_signal: bool = False,
     ) -> bool:
-        has_reviews = (reviews_count is not None and reviews_count > 0) or bool((seller_rating or "").strip())
+        has_reviews = (
+            (reviews_count is not None and reviews_count > 0)
+            or bool((seller_rating or "").strip())
+            or has_review_signal
+        )
         if review_filter == "with":
             return has_reviews
         if review_filter == "without":
-            return has_no_reviews_signal and not has_reviews
+            if has_reviews:
+                return False
+            if has_no_reviews_signal:
+                return True
+            return reviews_count in (None, 0)
         return True
 
     @staticmethod
@@ -1033,6 +1042,7 @@ class OLXParser:
                 review_filter,
                 details.get("seller_rating"),
                 bool(details.get("has_no_reviews_signal")),
+                bool(details.get("has_review_signal")),
             )
             decision = "pass" if online and review_match else "filtered"
             if not online:
