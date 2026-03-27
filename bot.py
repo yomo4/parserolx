@@ -70,6 +70,11 @@ def _option_values(default_value: int, preset_values: tuple[int, ...]) -> tuple[
 CHECK_OPTIONS = _option_values(config.MAX_LISTINGS_CHECK, (10, 20, 30, 50))
 PAGE_OPTIONS = _option_values(config.MAX_PAGES, (1, 2, 3, 5))
 ADMIN_CODE_DURATIONS = (7, 30, 90, 365)
+SETTINGS_PAGE_LABELS = {
+    "main": "Основное",
+    "category": "Категории",
+    "limits": "Фильтры",
+}
 
 
 class SearchState(StatesGroup):
@@ -461,6 +466,11 @@ def _city_button_label(city_filter: str) -> str:
     return label if len(label) <= 18 else f"{label[:17]}…"
 
 
+def _normalize_settings_page(value: str) -> str:
+    page = str(value or "main").strip().lower()
+    return page if page in SETTINGS_PAGE_LABELS else "main"
+
+
 def _display_query(query: str, settings: dict) -> str:
     if settings.get("search_mode") == "category_only":
         return "не используется"
@@ -503,6 +513,7 @@ def _extract_settings(data: dict) -> dict:
     if search_mode not in {"query", "category_only"}:
         search_mode = "query"
     return {
+        "settings_page": _normalize_settings_page(str(data.get("settings_page", "main"))),
         "search_mode": search_mode,
         "category_key": category_key,
         "city_filter": _normalize_city_filter(str(data.get("city_filter", ""))),
@@ -512,13 +523,15 @@ def _extract_settings(data: dict) -> dict:
     }
 
 
-def _build_settings_text(query: str, settings: dict) -> str:
+def _build_settings_text(query: str, settings: dict, page: str = "main") -> str:
+    page = _normalize_settings_page(page)
     return "\n\n".join(
         [
             "🎛 <b>Настройки парсинга</b>\n<i>Соберите сценарий поиска перед запуском</i>",
             _build_block(
                 "Сценарий",
                 [
+                    f"Экран: <b>{SETTINGS_PAGE_LABELS[page]}</b>",
                     f"Режим: <b>{_search_mode_label(settings['search_mode'])}</b>",
                     f"Запрос: <code>{escape(_display_query(query, settings))}</code>",
                     f"Категория: <b>{CATEGORY_OPTIONS[settings['category_key']]['label']}</b>",
@@ -548,7 +561,109 @@ def _build_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
     def mark(selected: bool, label: str) -> str:
         return f"✅ {label}" if selected else label
 
-    rows: list[list[InlineKeyboardButton]] = [
+    page = _normalize_settings_page(settings.get("settings_page", "main"))
+
+    if page == "category":
+        rows: list[list[InlineKeyboardButton]] = [
+            [
+                InlineKeyboardButton(
+                    text=mark(settings["category_key"] == "all", CATEGORY_OPTIONS["all"]["label"]),
+                    callback_data="cfg:category:all",
+                ),
+                InlineKeyboardButton(
+                    text=mark(
+                        settings["category_key"] == "electronics",
+                        CATEGORY_OPTIONS["electronics"]["label"],
+                    ),
+                    callback_data="cfg:category:electronics",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=mark(settings["category_key"] == "auto", CATEGORY_OPTIONS["auto"]["label"]),
+                    callback_data="cfg:category:auto",
+                ),
+                InlineKeyboardButton(
+                    text=mark(settings["category_key"] == "realty", CATEGORY_OPTIONS["realty"]["label"]),
+                    callback_data="cfg:category:realty",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=mark(settings["category_key"] == "jobs", CATEGORY_OPTIONS["jobs"]["label"]),
+                    callback_data="cfg:category:jobs",
+                ),
+                InlineKeyboardButton(
+                    text=mark(settings["category_key"] == "home", CATEGORY_OPTIONS["home"]["label"]),
+                    callback_data="cfg:category:home",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=mark(settings["category_key"] == "kids", CATEGORY_OPTIONS["kids"]["label"]),
+                    callback_data="cfg:category:kids",
+                ),
+                InlineKeyboardButton(
+                    text=mark(settings["category_key"] == "pets", CATEGORY_OPTIONS["pets"]["label"]),
+                    callback_data="cfg:category:pets",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=mark(settings["category_key"] == "fashion", CATEGORY_OPTIONS["fashion"]["label"]),
+                    callback_data="cfg:category:fashion",
+                ),
+            ],
+            [
+                InlineKeyboardButton(text="⬅️ Основное", callback_data="cfg:page:main"),
+                InlineKeyboardButton(text="➡️ Фильтры", callback_data="cfg:page:limits"),
+            ],
+            [
+                InlineKeyboardButton(text="🚀 Запустить", callback_data="cfg:start"),
+                InlineKeyboardButton(text="✖️ В меню", callback_data="cfg:cancel"),
+            ],
+        ]
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    if page == "limits":
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text=mark(settings["max_check"] == value, str(value)),
+                    callback_data=f"cfg:check:{value}",
+                )
+                for value in CHECK_OPTIONS
+            ],
+            [
+                InlineKeyboardButton(
+                    text=mark(settings["max_pages"] == value, f"{value} стр."),
+                    callback_data=f"cfg:pages:{value}",
+                )
+                for value in PAGE_OPTIONS
+            ],
+            [
+                InlineKeyboardButton(
+                    text=mark(settings["review_filter"] == value, label),
+                    callback_data=f"cfg:reviews:{value}",
+                )
+                for value, label in (
+                    ("any", "Любые"),
+                    ("with", "С отзывами"),
+                    ("without", "PRIVAT без отзывов"),
+                )
+            ],
+            [
+                InlineKeyboardButton(text="⬅️ Категории", callback_data="cfg:page:category"),
+                InlineKeyboardButton(text="🏠 Основное", callback_data="cfg:page:main"),
+            ],
+            [
+                InlineKeyboardButton(text="🚀 Запустить", callback_data="cfg:start"),
+                InlineKeyboardButton(text="✖️ В меню", callback_data="cfg:cancel"),
+            ],
+        ]
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    rows = [
         [
             InlineKeyboardButton(
                 text=mark(settings["search_mode"] == "query", "По запросу"),
@@ -557,55 +672,6 @@ def _build_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 text=mark(settings["search_mode"] == "category_only", "Только категория"),
                 callback_data="cfg:mode:category_only",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text=mark(settings["category_key"] == "all", CATEGORY_OPTIONS["all"]["label"]),
-                callback_data="cfg:category:all",
-            ),
-            InlineKeyboardButton(
-                text=mark(
-                    settings["category_key"] == "electronics",
-                    CATEGORY_OPTIONS["electronics"]["label"],
-                ),
-                callback_data="cfg:category:electronics",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text=mark(settings["category_key"] == "auto", CATEGORY_OPTIONS["auto"]["label"]),
-                callback_data="cfg:category:auto",
-            ),
-            InlineKeyboardButton(
-                text=mark(settings["category_key"] == "realty", CATEGORY_OPTIONS["realty"]["label"]),
-                callback_data="cfg:category:realty",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text=mark(settings["category_key"] == "jobs", CATEGORY_OPTIONS["jobs"]["label"]),
-                callback_data="cfg:category:jobs",
-            ),
-            InlineKeyboardButton(
-                text=mark(settings["category_key"] == "home", CATEGORY_OPTIONS["home"]["label"]),
-                callback_data="cfg:category:home",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text=mark(settings["category_key"] == "kids", CATEGORY_OPTIONS["kids"]["label"]),
-                callback_data="cfg:category:kids",
-            ),
-            InlineKeyboardButton(
-                text=mark(settings["category_key"] == "pets", CATEGORY_OPTIONS["pets"]["label"]),
-                callback_data="cfg:category:pets",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text=mark(settings["category_key"] == "fashion", CATEGORY_OPTIONS["fashion"]["label"]),
-                callback_data="cfg:category:fashion",
             ),
         ],
         [
@@ -619,33 +685,12 @@ def _build_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
             ),
         ],
         [
-            InlineKeyboardButton(
-                text=mark(settings["max_check"] == value, str(value)),
-                callback_data=f"cfg:check:{value}",
-            )
-            for value in CHECK_OPTIONS
-        ],
-        [
-            InlineKeyboardButton(
-                text=mark(settings["max_pages"] == value, f"{value} стр."),
-                callback_data=f"cfg:pages:{value}",
-            )
-            for value in PAGE_OPTIONS
-        ],
-        [
-            InlineKeyboardButton(
-                text=mark(settings["review_filter"] == value, label),
-                callback_data=f"cfg:reviews:{value}",
-            )
-            for value, label in (
-                ("any", "Любые"),
-                ("with", "С отзывами"),
-                ("without", "PRIVAT без отзывов"),
-            )
+            InlineKeyboardButton(text="➡️ Категории", callback_data="cfg:page:category"),
+            InlineKeyboardButton(text="➡️ Фильтры", callback_data="cfg:page:limits"),
         ],
         [
             InlineKeyboardButton(text="🚀 Запустить парсинг", callback_data="cfg:start"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data="cfg:cancel"),
+            InlineKeyboardButton(text="⬅️ В меню", callback_data="cfg:cancel"),
         ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1021,6 +1066,7 @@ async def handle_new_query_during_config(message: Message, state: FSMContext) ->
             state,
             str(data.get("query", "")),
             search_mode=str(data.get("search_mode", "query")),
+            settings_page="main",
         )
         return
     await _open_search_settings(message, state, (message.text or "").strip(), search_mode="query")
@@ -1090,6 +1136,14 @@ async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> 
             await callback.answer("Введите запрос минимум из 2 символов.", show_alert=True)
             return
         if settings["search_mode"] == "category_only" and settings["category_key"] == "all":
+            await state.update_data(settings_page="category", input_target=None)
+            updated_data = await state.get_data()
+            updated_settings = _extract_settings(updated_data)
+            await _show_panel(
+                callback.message,
+                _build_settings_text(query, updated_settings, updated_settings["settings_page"]),
+                _build_settings_keyboard(updated_settings),
+            )
             await callback.answer("Для режима по категории выберите конкретную категорию.", show_alert=True)
             return
         logger.info(
@@ -1108,10 +1162,15 @@ async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> 
         await run_search(callback.message, callback.from_user.id, normalized_query, settings)
         return
 
-    if action == "city" and len(parts) == 3:
+    if action == "page" and len(parts) == 3:
+        await state.update_data(
+            settings_page=_normalize_settings_page(parts[2]),
+            input_target=None,
+        )
+    elif action == "city" and len(parts) == 3:
         city_action = parts[2]
         if city_action == "set":
-            await state.update_data(input_target="city")
+            await state.update_data(input_target="city", settings_page="main")
             await callback.message.answer(
                 "🏙 <b>Фильтр по городу</b>\n\n"
                 "<blockquote><b>Отправьте название города одним сообщением</b>\n"
@@ -1122,7 +1181,7 @@ async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> 
             await callback.answer("Жду название города")
             return
         if city_action == "clear":
-            await state.update_data(city_filter="", input_target=None)
+            await state.update_data(city_filter="", input_target=None, settings_page="main")
         else:
             await callback.answer()
             return
@@ -1161,7 +1220,7 @@ async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> 
 
     await _show_panel(
         callback.message,
-        _build_settings_text(query, settings),
+        _build_settings_text(query, settings, settings["settings_page"]),
         _build_settings_keyboard(settings),
     )
     await callback.answer("Настройки обновлены")
@@ -1172,9 +1231,11 @@ async def _open_search_settings(
     state: FSMContext,
     query: str,
     search_mode: Optional[str] = None,
+    settings_page: Optional[str] = None,
 ) -> None:
     existing = await state.get_data()
     effective_mode = search_mode or str(existing.get("search_mode", "query"))
+    effective_page = _normalize_settings_page(settings_page or str(existing.get("settings_page", "main")))
 
     if effective_mode == "query" and len(query.strip()) < 2:
         await message.answer("❗ Запрос слишком короткий. Введите минимум 2 символа.")
@@ -1190,6 +1251,7 @@ async def _open_search_settings(
             pass
 
     settings = {
+        "settings_page": effective_page,
         "search_mode": effective_mode,
         "category_key": existing.get("category_key", "all"),
         "city_filter": _normalize_city_filter(str(existing.get("city_filter", ""))),
@@ -1202,7 +1264,7 @@ async def _open_search_settings(
     await state.update_data(query=query, input_target=None, **settings)
 
     sent = await message.answer(
-        _build_settings_text(query, settings),
+        _build_settings_text(query, settings, effective_page),
         parse_mode="HTML",
         reply_markup=_build_settings_keyboard(settings),
     )
