@@ -1,13 +1,6 @@
-# Telegram bot framework
-python-telegram-bot==20.7
-
-# Async HTTP client with SOCKS5 proxy support.
-# Pinned to the version range required by python-telegram-bot 20.7.
-httpx[socks]==0.25.2
-
-# HTML parsing (fallback page scraping)
+aiogram==3.7.0
+aiohttp==3.9.5
 beautifulsoup4==4.12.3
+curl_cffi==0.7.4
 lxml==5.2.1
-
-# Environment variable loading
 python-dotenv==1.0.1
