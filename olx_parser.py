@@ -442,6 +442,14 @@ class OLXParser:
         if count is not None:
             return count
 
+        count = self._extract_reviews_count_from_review_nodes(soup)
+        if count is not None:
+            return count
+
+        count = self._extract_reviews_count_from_scripts(soup)
+        if count is not None:
+            return count
+
         full_text = self._normalize_match_text(soup.get_text(" ", strip=True))
         match = _REVIEWS_RE.search(full_text)
         if match:
@@ -458,8 +466,39 @@ class OLXParser:
         try:
             page_props = data["props"]["pageProps"]
         except (KeyError, TypeError):
-            return None
-        return self._find_reviews_count(page_props)
+            page_props = None
+
+        if page_props is not None:
+            count = self._find_reviews_count(page_props)
+            if count is not None:
+                return count
+
+        return self._find_reviews_count(data)
+
+    def _extract_reviews_count_from_review_nodes(self, soup: BeautifulSoup) -> Optional[int]:
+        for element in soup.find_all(attrs={"data-testid": re.compile(r"(review|rating|feedback)", re.IGNORECASE)}):
+            text = self._normalize_match_text(element.get_text(" ", strip=True))
+            if not text:
+                continue
+            match = _REVIEWS_RE.search(text)
+            if match:
+                return int(match.group(1))
+            if _NO_REVIEWS_RE.search(text):
+                return 0
+        return None
+
+    def _extract_reviews_count_from_scripts(self, soup: BeautifulSoup) -> Optional[int]:
+        for script in soup.find_all("script"):
+            script_text = script.string or script.get_text(" ", strip=True)
+            if not script_text:
+                continue
+            normalized = self._normalize_match_text(script_text)
+            match = _REVIEWS_RE.search(normalized)
+            if match:
+                return int(match.group(1))
+            if _NO_REVIEWS_RE.search(normalized):
+                return 0
+        return None
 
     def _find_reviews_count(self, obj: Any) -> Optional[int]:
         if isinstance(obj, dict):
@@ -534,7 +573,7 @@ class OLXParser:
         if review_filter == "with":
             return reviews_count is not None and reviews_count > 0
         if review_filter == "without":
-            return reviews_count == 0
+            return reviews_count is None or reviews_count == 0
         return True
 
     async def _notify_progress(
@@ -650,11 +689,12 @@ class OLXParser:
             review_match = self._matches_review_filter(reviews_count, review_filter)
 
             logger.info(
-                "[CHECK] %d/%d online=%s reviews=%r review_match=%s requests=%d",
+                "[CHECK] %d/%d online=%s reviews=%r filter=%s review_match=%s requests=%d",
                 idx,
                 total,
                 "yes" if online else "no",
                 reviews_count,
+                review_filter,
                 "yes" if review_match else "no",
                 stats.requests_made,
             )

@@ -360,7 +360,7 @@ def _build_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
             for value, label in (
                 ("any", "Любые"),
                 ("with", "С отзывами"),
-                ("without", "Без отзывов"),
+                ("without", "Без подтв. отзывов"),
             )
         ],
         [
