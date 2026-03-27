@@ -60,9 +60,10 @@ _NO_REVIEWS_RE = re.compile(
 _SELLER_RATING_VALUE_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*/\s*5", re.IGNORECASE)
 _SELLER_PRIVATE_RE = re.compile(r"\b(?:privat|private|persoana fizica)\b", re.IGNORECASE)
 _SELLER_BUSINESS_RE = re.compile(
-    r"\b(?:firma|companie|company|business|dealer|magazin|persoana juridica)\b",
+    r"\b(?:firma|companie|company|business|persoana juridica)\b",
     re.IGNORECASE,
 )
+_VISIBLE_TEXT_SKIP_TAGS = {"script", "style", "noscript", "svg", "path", "meta", "link", "head", "title"}
 
 _REVIEW_KEYS = {
     "reviewcount",
@@ -81,6 +82,7 @@ class SearchStats:
     max_check: int
     review_filter: str
     category_path: str = ""
+    city_filter: str = ""
     requests_made: int = 0
     pages_loaded: int = 0
     listings_seen: int = 0
@@ -130,6 +132,15 @@ class OLXParser:
         if page > 1:
             url += f"?page={page}"
         return url
+
+    def _matches_city_filter(self, location: str, city_filter: str) -> bool:
+        city_norm = self._normalize_match_text(city_filter)
+        if not city_norm:
+            return True
+        location_norm = self._normalize_match_text(location)
+        if not location_norm:
+            return False
+        return city_norm in location_norm
 
     def _build_headers(self) -> dict:
         headers = {
@@ -284,7 +295,13 @@ class OLXParser:
         except asyncio.TimeoutError:
             logger.error("HTTP timeout | elapsed=%.2fs | %s", time.monotonic() - started, url)
         except aiohttp.ClientError as exc:
-            logger.warning("AIOHTTP error | %r | %s", exc, url)
+            status = getattr(exc, "status", None)
+            logger.warning(
+                "AIOHTTP error | type=%s status=%s | %s",
+                exc.__class__.__name__,
+                status if status is not None else "-",
+                url,
+            )
             text = await asyncio.to_thread(self._fetch_with_curl, url, stats)
             if text:
                 return text
@@ -541,6 +558,48 @@ class OLXParser:
                     return text.strip()
         return None
 
+    def _visible_text_chunks(self, soup: BeautifulSoup, limit: Optional[int] = None) -> list[str]:
+        chunks: list[str] = []
+        seen: set[str] = set()
+
+        for text_node in soup.find_all(string=True):
+            parent = getattr(text_node, "parent", None)
+            parent_name = getattr(parent, "name", "")
+            if parent_name in _VISIBLE_TEXT_SKIP_TAGS:
+                continue
+
+            text = re.sub(r"\s+", " ", str(text_node)).strip()
+            if not text:
+                continue
+
+            normalized = self._normalize_match_text(text)
+            if not normalized or normalized in seen:
+                continue
+
+            seen.add(normalized)
+            chunks.append(text[:220])
+            if limit and len(chunks) >= limit:
+                break
+
+        return chunks
+
+    def _extract_seller_type_from_texts(self, texts: list[str]) -> Optional[str]:
+        has_private = False
+        has_business = False
+
+        for text in texts:
+            normalized = self._normalize_match_text(text)
+            if _SELLER_PRIVATE_RE.search(normalized):
+                has_private = True
+            if _SELLER_BUSINESS_RE.search(normalized):
+                has_business = True
+
+        if has_private:
+            return "private"
+        if has_business:
+            return "business"
+        return None
+
     def _parse_seller_type(self, soup: BeautifulSoup) -> Optional[str]:
         data = self._get_nextdata(soup)
         if data:
@@ -558,18 +617,19 @@ class OLXParser:
             except (KeyError, TypeError):
                 pass
 
-        seller_text = self._normalize_match_text(" | ".join(self._collect_seller_texts(soup)))
-        if _SELLER_BUSINESS_RE.search(seller_text):
-            return "business"
-        if _SELLER_PRIVATE_RE.search(seller_text):
-            return "private"
+        seller_texts = self._collect_seller_texts(soup)
+        seller_type = self._extract_seller_type_from_texts(seller_texts)
+        if seller_type:
+            return seller_type
 
-        full_text = self._normalize_match_text(soup.get_text(" ", strip=True))
-        if _SELLER_BUSINESS_RE.search(full_text):
-            return "business"
-        if _SELLER_PRIVATE_RE.search(full_text):
-            return "private"
-        return None
+        visible_texts = self._visible_text_chunks(soup, limit=250)
+        account_texts = [
+            text
+            for text in visible_texts
+            if _SELLER_PRIVATE_RE.search(self._normalize_match_text(text))
+            or _SELLER_BUSINESS_RE.search(self._normalize_match_text(text))
+        ]
+        return self._extract_seller_type_from_texts(account_texts)
 
     def _parse_seller_rating_value(self, soup: BeautifulSoup) -> Optional[str]:
         data = self._get_nextdata(soup)
@@ -626,24 +686,17 @@ class OLXParser:
 
     def _collect_seller_texts(self, soup: BeautifulSoup) -> list[str]:
         snippets: list[str] = []
-        seen: set[str] = set()
-        for element in soup.find_all(True):
-            data_testid = str(element.get("data-testid") or "")
-            classes = " ".join(element.get("class", [])) if isinstance(element.get("class"), list) else str(element.get("class") or "")
-            marker = f"{data_testid} {classes}".lower()
-            text = re.sub(r"\s+", " ", element.get_text(" ", strip=True)).strip()
-            if not text:
-                continue
+        for text in self._visible_text_chunks(soup, limit=300):
             normalized_text = self._normalize_match_text(text)
-            if any(token in marker for token in ("seller", "user", "profile", "rating", "review", "feedback", "account")) or any(
+            if any(
                 token in normalized_text
                 for token in (
                     "privat",
+                    "persoana fizica",
                     "firma",
                     "companie",
                     "business",
                     "company",
-                    "dealer",
                     "ratinguri",
                     "rating",
                     "review",
@@ -652,11 +705,10 @@ class OLXParser:
                     "olx din",
                     "activ azi",
                     "activ acum",
+                    "contacteaza vanzatorul",
                 )
             ):
-                if text not in seen:
-                    seen.add(text)
-                    snippets.append(text[:220])
+                snippets.append(text[:220])
             if len(snippets) >= 12:
                 break
         return snippets
@@ -739,7 +791,7 @@ class OLXParser:
         if count is not None:
             return count, "scripts", count > 0, count == 0
 
-        full_text = self._normalize_match_text(soup.get_text(" ", strip=True))
+        full_text = self._normalize_match_text(" ".join(self._visible_text_chunks(soup, limit=600)))
         match = _REVIEWS_RE.search(full_text)
         if match:
             count = int(match.group(1))
@@ -955,6 +1007,7 @@ class OLXParser:
         max_pages: int = 3,
         max_check: int = 30,
         category_path: str = "",
+        city_filter: str = "",
         review_filter: str = "any",
         progress_callback: Optional[ProgressCallback] = None,
     ) -> SearchResult:
@@ -963,13 +1016,15 @@ class OLXParser:
             max_check=max_check,
             review_filter=review_filter,
             category_path=category_path.strip("/"),
+            city_filter=city_filter.strip(),
         )
 
         logger.info("=" * 55)
         logger.info(
-            "[SEARCH] query=%r category=%s pages=%d limit=%d reviews=%s",
+            "[SEARCH] query=%r category=%s city=%r pages=%d limit=%d reviews=%s",
             query,
             stats.category_path or "all",
+            stats.city_filter or "all",
             max_pages,
             max_check,
             review_filter,
@@ -991,7 +1046,11 @@ class OLXParser:
                 break
 
             new_count = 0
+            city_skipped = 0
             for card in cards:
+                if stats.city_filter and not self._matches_city_filter(str(card.get("location") or ""), stats.city_filter):
+                    city_skipped += 1
+                    continue
                 url = card.get("url", "")
                 if url and url not in seen_urls:
                     seen_urls.add(url)
@@ -1000,10 +1059,11 @@ class OLXParser:
 
             stats.listings_seen = len(all_listings)
             logger.info(
-                "[SEARCH] page=%d new=%d dup=%d total=%d",
+                "[SEARCH] page=%d new=%d city_skip=%d dup=%d total=%d",
                 page,
                 new_count,
-                len(cards) - new_count,
+                city_skipped,
+                max(len(cards) - city_skipped - new_count, 0),
                 len(all_listings),
             )
             await self._notify_progress(
@@ -1097,9 +1157,10 @@ class OLXParser:
         stats.finish()
         logger.info("-" * 55)
         logger.info(
-            "[READY] query=%r category=%s checked=%d matched=%d requests=%d elapsed=%.1fs",
+            "[READY] query=%r category=%s city=%r checked=%d matched=%d requests=%d elapsed=%.1fs",
             query,
             stats.category_path or "all",
+            stats.city_filter or "all",
             stats.listings_checked,
             len(filtered),
             stats.requests_made,

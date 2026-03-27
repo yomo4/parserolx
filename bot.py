@@ -443,6 +443,24 @@ def _search_mode_label(search_mode: str) -> str:
     return "только категория" if search_mode == "category_only" else "по запросу"
 
 
+def _normalize_city_filter(value: str) -> str:
+    cleaned = " ".join(str(value or "").split()).strip(" ,.")
+    if not cleaned:
+        return ""
+    if cleaned.casefold() in {"любой", "любой город", "вся страна", "all", "any", "-"}:
+        return ""
+    return cleaned[:60]
+
+
+def _city_filter_label(city_filter: str) -> str:
+    return city_filter if city_filter else "вся страна"
+
+
+def _city_button_label(city_filter: str) -> str:
+    label = _city_filter_label(city_filter)
+    return label if len(label) <= 18 else f"{label[:17]}…"
+
+
 def _display_query(query: str, settings: dict) -> str:
     if settings.get("search_mode") == "category_only":
         return "не используется"
@@ -467,6 +485,7 @@ def _build_search_key(query: str, settings: dict) -> str:
         (
             f"mode={settings['search_mode']}",
             f"category={settings['category_key']}",
+            f"city={_normalize_city_filter(settings.get('city_filter', '')).casefold()}",
             f"reviews={settings['review_filter']}",
             f"query={normalized_query}",
         )
@@ -486,6 +505,7 @@ def _extract_settings(data: dict) -> dict:
     return {
         "search_mode": search_mode,
         "category_key": category_key,
+        "city_filter": _normalize_city_filter(str(data.get("city_filter", ""))),
         "max_check": int(data.get("max_check", config.MAX_LISTINGS_CHECK)),
         "max_pages": int(data.get("max_pages", config.MAX_PAGES)),
         "review_filter": review_filter,
@@ -502,6 +522,7 @@ def _build_settings_text(query: str, settings: dict) -> str:
                     f"Режим: <b>{_search_mode_label(settings['search_mode'])}</b>",
                     f"Запрос: <code>{escape(_display_query(query, settings))}</code>",
                     f"Категория: <b>{CATEGORY_OPTIONS[settings['category_key']]['label']}</b>",
+                    f"Город: <b>{escape(_city_filter_label(settings['city_filter']))}</b>",
                 ],
             ),
             _build_block(
@@ -585,6 +606,16 @@ def _build_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 text=mark(settings["category_key"] == "fashion", CATEGORY_OPTIONS["fashion"]["label"]),
                 callback_data="cfg:category:fashion",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"🏙 {_city_button_label(settings.get('city_filter', ''))}",
+                callback_data="cfg:city:set",
+            ),
+            InlineKeyboardButton(
+                text="🧹 Сбросить" if settings.get("city_filter") else "🌍 Вся страна",
+                callback_data="cfg:city:clear",
             ),
         ],
         [
@@ -979,6 +1010,19 @@ async def handle_new_query_during_config(message: Message, state: FSMContext) ->
             reply_markup=_build_subscription_keyboard(message.from_user.id),
         )
         return
+    data = await state.get_data()
+    if data.get("input_target") == "city":
+        await state.update_data(
+            city_filter=_normalize_city_filter(message.text or ""),
+            input_target=None,
+        )
+        await _open_search_settings(
+            message,
+            state,
+            str(data.get("query", "")),
+            search_mode=str(data.get("search_mode", "query")),
+        )
+        return
     await _open_search_settings(message, state, (message.text or "").strip(), search_mode="query")
 
 
@@ -1064,7 +1108,25 @@ async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> 
         await run_search(callback.message, callback.from_user.id, normalized_query, settings)
         return
 
-    if action == "mode" and len(parts) == 3:
+    if action == "city" and len(parts) == 3:
+        city_action = parts[2]
+        if city_action == "set":
+            await state.update_data(input_target="city")
+            await callback.message.answer(
+                "🏙 <b>Фильтр по городу</b>\n\n"
+                "<blockquote><b>Отправьте название города одним сообщением</b>\n"
+                "Например: <code>Bucuresti</code>, <code>Iasi</code>, <code>Cluj-Napoca</code>\n"
+                "Чтобы убрать фильтр, отправьте: <code>любой</code></blockquote>",
+                parse_mode="HTML",
+            )
+            await callback.answer("Жду название города")
+            return
+        if city_action == "clear":
+            await state.update_data(city_filter="", input_target=None)
+        else:
+            await callback.answer()
+            return
+    elif action == "mode" and len(parts) == 3:
         new_mode = parts[2]
         if new_mode == "query":
             await state.update_data(search_mode="query")
@@ -1085,6 +1147,7 @@ async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> 
         await callback.answer()
         return
 
+    await state.update_data(input_target=None)
     updated_data = await state.get_data()
     settings = _extract_settings(updated_data)
     query = str(updated_data.get("query", ""))
@@ -1129,13 +1192,14 @@ async def _open_search_settings(
     settings = {
         "search_mode": effective_mode,
         "category_key": existing.get("category_key", "all"),
+        "city_filter": _normalize_city_filter(str(existing.get("city_filter", ""))),
         "max_check": existing.get("max_check", config.MAX_LISTINGS_CHECK),
         "max_pages": existing.get("max_pages", config.MAX_PAGES),
         "review_filter": existing.get("review_filter", "any"),
     }
 
     await state.set_state(SearchState.configuring_search)
-    await state.update_data(query=query, **settings)
+    await state.update_data(query=query, input_target=None, **settings)
 
     sent = await message.answer(
         _build_settings_text(query, settings),
@@ -1194,6 +1258,7 @@ async def run_search(message: Message, requester_id: int, query: str, settings: 
             max_pages=settings["max_pages"],
             max_check=settings["max_check"],
             category_path=CATEGORY_OPTIONS[settings["category_key"]]["path"],
+            city_filter=settings["city_filter"],
             review_filter=settings["review_filter"],
             progress_callback=on_progress,
         )
@@ -1254,6 +1319,7 @@ async def _show_search_result(
                             [
                                 f"Цель: <b>{escape(_search_target_text(query, settings))}</b>",
                                 f"Уже показанных пропущено: <b>{skipped_seen}</b>",
+                                f"Город: <b>{escape(_city_filter_label(settings['city_filter']))}</b>",
                                 f"Память ссылок: <b>{config.SEEN_LINK_TTL_HOURS} ч.</b>",
                                 f"Фильтр отзывов: <b>{REVIEW_FILTER_LABELS[settings['review_filter']]}</b>",
                             ],
@@ -1272,6 +1338,7 @@ async def _show_search_result(
                             [
                                 f"Цель: <b>{escape(_search_target_text(query, settings))}</b>",
                                 f"Категория: <b>{CATEGORY_OPTIONS[settings['category_key']]['label']}</b>",
+                                f"Город: <b>{escape(_city_filter_label(settings['city_filter']))}</b>",
                                 f"Фильтр отзывов: <b>{REVIEW_FILTER_LABELS[settings['review_filter']]}</b>",
                             ],
                         ),
@@ -1343,6 +1410,7 @@ def _build_status_text(query: str, settings: dict, progress: dict | None = None)
             f"Цель: <b>{escape(_search_target_text(query, settings))}</b>",
             f"Режим: <b>{_search_mode_label(settings['search_mode'])}</b>",
             f"Категория: <b>{CATEGORY_OPTIONS[settings['category_key']]['label']}</b>",
+            f"Город: <b>{escape(_city_filter_label(settings['city_filter']))}</b>",
             f"Фильтр: <b>{REVIEW_FILTER_LABELS[settings['review_filter']]}</b>",
         ],
     )
@@ -1403,6 +1471,7 @@ def _build_completion_text(query: str, settings: dict, stats, found: int) -> str
                 f"Цель: <b>{escape(_search_target_text(query, settings))}</b>",
                 f"Режим: <b>{_search_mode_label(settings['search_mode'])}</b>",
                 f"Категория: <b>{CATEGORY_OPTIONS[settings['category_key']]['label']}</b>",
+                f"Город: <b>{escape(_city_filter_label(settings['city_filter']))}</b>",
                 f"Найдено онлайн: <b>{found}</b>",
                 f"Фильтр отзывов: <b>{REVIEW_FILTER_LABELS[settings['review_filter']]}</b>",
             ],
@@ -1447,6 +1516,7 @@ def _build_final_summary_text(
             [
                 f"Цель: <b>{escape(_search_target_text(query, settings))}</b>",
                 f"Категория: <b>{escape(CATEGORY_OPTIONS[settings['category_key']]['label'])}</b>",
+                f"Город: <b>{escape(_city_filter_label(settings['city_filter']))}</b>",
                 f"Проверено объявлений: <b>{stats.listings_checked}</b>",
                 f"Страниц поиска: <b>{stats.pages_loaded}</b>",
                 f"Запросов к OLX: <b>{stats.requests_made}</b>",
