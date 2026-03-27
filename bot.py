@@ -44,7 +44,7 @@ db = BotDatabase(config.DB_PATH)
 REVIEW_FILTER_LABELS = {
     "any": "любые",
     "with": "только с отзывами",
-    "without": "только без подтвержденных отзывов",
+    "without": "только PRIVAT без отзывов",
 }
 
 CATEGORY_OPTIONS = {
@@ -332,7 +332,7 @@ def _build_settings_text(query: str, settings: dict) -> str:
         f"Объявлений на проверку: <b>{settings['max_check']}</b>\n"
         f"Страниц поиска: <b>{settings['max_pages']}</b>\n"
         f"Отзывы: <b>{REVIEW_FILTER_LABELS[settings['review_filter']]}</b>\n\n"
-        "Фильтр по отзывам работает только по подтвержденным данным, чтобы уменьшить ложные отсечки."
+        "Режим без отзывов теперь пропускает только PRIVAT и режет FIRMA/COMPANIE."
     )
 
 
@@ -422,7 +422,7 @@ def _build_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
             for value, label in (
                 ("any", "Любые"),
                 ("with", "С отзывами"),
-                ("without", "Без подтв. отзывов"),
+                ("without", "PRIVAT без отзывов"),
             )
         ],
         [

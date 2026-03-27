@@ -58,6 +58,11 @@ _NO_REVIEWS_RE = re.compile(
 )
 
 _SELLER_RATING_VALUE_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*/\s*5", re.IGNORECASE)
+_SELLER_PRIVATE_RE = re.compile(r"\b(?:privat|private|persoana fizica)\b", re.IGNORECASE)
+_SELLER_BUSINESS_RE = re.compile(
+    r"\b(?:firma|companie|company|business|dealer|magazin|persoana juridica)\b",
+    re.IGNORECASE,
+)
 
 _REVIEW_KEYS = {
     "reviewcount",
@@ -546,12 +551,17 @@ class OLXParser:
             except (KeyError, TypeError):
                 pass
 
-        full_text = soup.get_text(" ", strip=True)
-        normalized = self._normalize_match_text(full_text)
-        if re.search(r"\bprivat\b", normalized):
-            return "private"
-        if re.search(r"\bcompanie\b|\bbusiness\b|\bdealer\b", normalized):
+        seller_text = self._normalize_match_text(" | ".join(self._collect_seller_texts(soup)))
+        if _SELLER_BUSINESS_RE.search(seller_text):
             return "business"
+        if _SELLER_PRIVATE_RE.search(seller_text):
+            return "private"
+
+        full_text = self._normalize_match_text(soup.get_text(" ", strip=True))
+        if _SELLER_BUSINESS_RE.search(full_text):
+            return "business"
+        if _SELLER_PRIVATE_RE.search(full_text):
+            return "private"
         return None
 
     def _parse_seller_rating_value(self, soup: BeautifulSoup) -> Optional[str]:
@@ -607,26 +617,45 @@ class OLXParser:
                     return rating
         return None
 
-    def _collect_seller_debug(self, soup: BeautifulSoup) -> str:
+    def _collect_seller_texts(self, soup: BeautifulSoup) -> list[str]:
         snippets: list[str] = []
         seen: set[str] = set()
         for element in soup.find_all(True):
             data_testid = str(element.get("data-testid") or "")
             classes = " ".join(element.get("class", [])) if isinstance(element.get("class"), list) else str(element.get("class") or "")
             marker = f"{data_testid} {classes}".lower()
-            text = element.get_text(" ", strip=True)
+            text = re.sub(r"\s+", " ", element.get_text(" ", strip=True)).strip()
             if not text:
                 continue
             normalized_text = self._normalize_match_text(text)
-            if any(token in marker for token in ("seller", "user", "profile", "rating", "review", "feedback")) or any(
-                token in normalized_text for token in ("privat", "companie", "rating", "review", "activ", "olx din")
+            if any(token in marker for token in ("seller", "user", "profile", "rating", "review", "feedback", "account")) or any(
+                token in normalized_text
+                for token in (
+                    "privat",
+                    "firma",
+                    "companie",
+                    "business",
+                    "company",
+                    "dealer",
+                    "ratinguri",
+                    "rating",
+                    "review",
+                    "evaluari",
+                    "feedback",
+                    "olx din",
+                    "activ azi",
+                    "activ acum",
+                )
             ):
-                snippet = f"{data_testid or '-'}:{text[:140]}"
-                if snippet not in seen:
-                    seen.add(snippet)
-                    snippets.append(snippet)
-            if len(snippets) >= 8:
+                if text not in seen:
+                    seen.add(text)
+                    snippets.append(text[:220])
+            if len(snippets) >= 12:
                 break
+        return snippets
+
+    def _collect_seller_debug(self, soup: BeautifulSoup) -> str:
+        snippets = self._collect_seller_texts(soup)
         return " | ".join(snippets[:8]) if snippets else "no-seller-snippets"
 
     def _parse_description(self, soup: BeautifulSoup) -> str:
@@ -695,6 +724,10 @@ class OLXParser:
         if count is not None:
             return count, "review_nodes", count > 0
 
+        count = self._extract_reviews_count_from_texts(self._collect_seller_texts(soup))
+        if count is not None:
+            return count, "seller_text", count > 0
+
         count = self._extract_reviews_count_from_scripts(soup)
         if count is not None:
             return count, "scripts", count > 0
@@ -711,6 +744,16 @@ class OLXParser:
         if seller_rating:
             return None, "rating_fallback", True
         return None, "unknown", False
+
+    def _extract_reviews_count_from_texts(self, texts: list[str]) -> Optional[int]:
+        for text in texts:
+            normalized = self._normalize_match_text(text)
+            match = _REVIEWS_RE.search(normalized)
+            if match:
+                return int(match.group(1))
+            if _NO_REVIEWS_RE.search(normalized):
+                return 0
+        return None
 
     def _extract_reviews_count_nextdata(self, soup: BeautifulSoup) -> Optional[int]:
         data = self._get_nextdata(soup)
@@ -840,6 +883,15 @@ class OLXParser:
             return not has_reviews and (reviews_count is None or reviews_count == 0)
         return True
 
+    @staticmethod
+    def _matches_seller_type_filter(seller_type: Optional[str], review_filter: str) -> bool:
+        normalized = (seller_type or "").strip().lower()
+        if normalized == "business":
+            return False
+        if review_filter == "without":
+            return normalized == "private"
+        return True
+
     async def _notify_progress(
         self,
         callback: Optional[ProgressCallback],
@@ -950,6 +1002,8 @@ class OLXParser:
 
             online = self.is_online_today(details["last_online"])
             reviews_count = details["reviews_count"]
+            seller_type = details.get("seller_type")
+            seller_match = self._matches_seller_type_filter(seller_type, review_filter)
             review_match = self._matches_review_filter(
                 reviews_count,
                 review_filter,
@@ -958,15 +1012,18 @@ class OLXParser:
             decision = "pass" if online and review_match else "filtered"
             if not online:
                 decision = "filtered_offline"
+            elif not seller_match:
+                decision = "filtered_seller_type"
             elif not review_match:
                 decision = "filtered_reviews"
 
             logger.info(
-                "[CHECK] %d/%d online=%s seller_type=%r seller=%r rating=%r reviews=%r source=%s signal=%s filter=%s review_match=%s decision=%s requests=%d",
+                "[CHECK] %d/%d online=%s seller_type=%r seller_match=%s seller=%r rating=%r reviews=%r source=%s signal=%s filter=%s review_match=%s decision=%s requests=%d",
                 idx,
                 total,
                 "yes" if online else "no",
-                details.get("seller_type"),
+                seller_type,
+                "yes" if seller_match else "no",
                 details.get("seller_name"),
                 details.get("seller_rating"),
                 reviews_count,
@@ -978,7 +1035,7 @@ class OLXParser:
                 stats.requests_made,
             )
 
-            if online and review_match:
+            if online and seller_match and review_match:
                 listing["last_online"] = details["last_online"]
                 listing["description"] = details["description"]
                 listing["images"] = details["images"]
