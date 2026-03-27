@@ -12,6 +12,7 @@ import socket
 import time
 import unicodedata
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import quote
 
@@ -97,6 +98,7 @@ class OLXParser:
 
     def __init__(self) -> None:
         self._session: Optional[aiohttp.ClientSession] = None
+        self._cookie_header = self._load_cookie_header()
 
     @staticmethod
     def _build_search_slug(query: str) -> str:
@@ -122,7 +124,7 @@ class OLXParser:
         return url
 
     def _build_headers(self) -> dict:
-        return {
+        headers = {
             "User-Agent": random.choice(_USER_AGENTS),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
             "image/avif,image/webp,*/*;q=0.8",
@@ -135,12 +137,79 @@ class OLXParser:
             "Sec-Fetch-Site": "none",
             "Cache-Control": "max-age=0",
         }
+        if self._cookie_header:
+            headers["Cookie"] = self._cookie_header
+        return headers
 
     @staticmethod
     def _normalize_match_text(text: str) -> str:
         normalized = unicodedata.normalize("NFKD", text)
         ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
         return re.sub(r"\s+", " ", ascii_text).strip().lower()
+
+    def _load_cookie_header(self) -> str:
+        source = Path(config.COOKIE_SOURCE)
+        if not source.is_absolute():
+            source = Path.cwd() / source
+
+        cookie_file = self._discover_cookie_file(source)
+        if not cookie_file:
+            logger.info("[COOKIE] Cookie source not found: %s", source)
+            return ""
+
+        try:
+            raw = cookie_file.read_text(encoding="utf-8")
+            payload = json.loads(raw)
+        except Exception as exc:
+            logger.warning("[COOKIE] Failed to read cookie file %s: %r", cookie_file, exc)
+            return ""
+
+        if not isinstance(payload, list):
+            logger.warning("[COOKIE] Unsupported cookie format in %s", cookie_file)
+            return ""
+
+        now_ts = int(time.time())
+        cookies: dict[str, str] = {}
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            domain = str(item.get("domain") or "")
+            if "olx.ro" not in domain:
+                continue
+
+            name = str(item.get("name") or "").strip()
+            value = str(item.get("value") or "")
+            if not name:
+                continue
+
+            expires = item.get("expires")
+            if isinstance(expires, (int, float)) and expires not in (0,):
+                if int(expires) < now_ts:
+                    continue
+
+            cookies[name] = value
+
+        if not cookies:
+            logger.warning("[COOKIE] No active OLX cookies found in %s", cookie_file)
+            return ""
+
+        header = "; ".join(f"{name}={value}" for name, value in cookies.items())
+        logger.info("[COOKIE] Loaded %d OLX cookies from %s", len(cookies), cookie_file.name)
+        return header
+
+    @staticmethod
+    def _discover_cookie_file(source: Path) -> Optional[Path]:
+        if source.is_file():
+            return source
+        if source.is_dir():
+            files = sorted(
+                [path for path in source.iterdir() if path.is_file() and path.suffix.lower() in {".txt", ".json"}],
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            if files:
+                return files[0]
+        return None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:

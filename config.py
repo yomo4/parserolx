@@ -37,3 +37,6 @@ ADMIN_IDS: tuple[int, ...] = _parse_admin_ids(os.getenv("ADMIN_IDS", "8458119704
 
 # SQLite база данных
 DB_PATH: str = os.getenv("DB_PATH", "data/bot.sqlite3")
+
+# Файл или папка с cookies OLX
+COOKIE_SOURCE: str = os.getenv("COOKIE_SOURCE", "cookie olx")
