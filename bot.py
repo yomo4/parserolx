@@ -40,6 +40,8 @@ bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 parser = OLXParser()
 db = BotDatabase(config.DB_PATH)
+SEARCH_SEMAPHORE = asyncio.Semaphore(getattr(config, "MAX_CONCURRENT_SEARCHES", 3))
+ACTIVE_SEARCH_TASKS: dict[int, asyncio.Task] = {}
 
 
 REVIEW_FILTER_LABELS = {
@@ -108,6 +110,28 @@ def _is_admin(user_id: int) -> bool:
 
 def _has_access(user_id: int) -> bool:
     return _is_admin(user_id) or db.has_active_subscription(user_id)
+
+
+def _has_active_search(user_id: int) -> bool:
+    task = ACTIVE_SEARCH_TASKS.get(user_id)
+    return bool(task and not task.done())
+
+
+def _register_search_task(user_id: int, task: asyncio.Task) -> None:
+    ACTIVE_SEARCH_TASKS[user_id] = task
+
+    def _cleanup(done_task: asyncio.Task) -> None:
+        current = ACTIVE_SEARCH_TASKS.get(user_id)
+        if current is done_task:
+            ACTIVE_SEARCH_TASKS.pop(user_id, None)
+        try:
+            done_task.exception()
+        except asyncio.CancelledError:
+            logger.info("[SEARCH] Task cancelled | user=%s", user_id)
+        except Exception:
+            logger.exception("[SEARCH] Background task failed | user=%s", user_id)
+
+    task.add_done_callback(_cleanup)
 
 
 def _format_datetime(value: Optional[str]) -> str:
@@ -1146,6 +1170,10 @@ async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> 
             )
             await callback.answer("Для режима по категории выберите конкретную категорию.", show_alert=True)
             return
+        if _has_active_search(callback.from_user.id):
+            await callback.answer("Поиск уже запущен. Дождитесь завершения текущего запроса.", show_alert=True)
+            return
+
         logger.info(
             "[UI] Search started | chat=%s | user=%s | query=%r | settings=%s",
             callback.message.chat.id,
@@ -1159,7 +1187,8 @@ async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> 
         except Exception:
             pass
         await callback.answer("Запускаю парсинг...")
-        await run_search(callback.message, callback.from_user.id, normalized_query, settings)
+        task = asyncio.create_task(run_search(callback.message, callback.from_user.id, normalized_query, settings))
+        _register_search_task(callback.from_user.id, task)
         return
 
     if action == "page" and len(parts) == 3:
@@ -1313,38 +1342,54 @@ async def run_search(message: Message, requester_id: int, query: str, settings: 
             logger.exception("Failed to update search status")
 
     try:
-        await bot.send_chat_action(message.chat.id, "typing")
+        if SEARCH_SEMAPHORE.locked():
+            await status_msg.edit_text(
+                _build_status_text(
+                    query,
+                    settings,
+                    {
+                        "phase": "queue",
+                        "queued": True,
+                        "checked": 0,
+                        "total": 0,
+                    },
+                ),
+                parse_mode="HTML",
+            )
 
-        result: SearchResult = await parser.search(
-            query,
-            max_pages=settings["max_pages"],
-            max_check=settings["max_check"],
-            category_path=CATEGORY_OPTIONS[settings["category_key"]]["path"],
-            city_filter=settings["city_filter"],
-            review_filter=settings["review_filter"],
-            progress_callback=on_progress,
-        )
+        async with SEARCH_SEMAPHORE:
+            await bot.send_chat_action(message.chat.id, "typing")
 
-        fresh_listings, skipped_seen = db.filter_new_listings(
-            requester_id,
-            search_key,
-            result.listings,
-            config.SEEN_LINK_TTL_HOURS,
-        )
-        result.stats.already_seen_skipped = skipped_seen
-        result.stats.listings_matched = len(fresh_listings)
-        logger.info(
-            "[DEDUPE] user=%s key=%r matched=%d new=%d skipped_seen=%d ttl_hours=%d",
-            requester_id,
-            search_key,
-            len(result.listings),
-            len(fresh_listings),
-            skipped_seen,
-            config.SEEN_LINK_TTL_HOURS,
-        )
-        result = SearchResult(listings=fresh_listings, stats=result.stats)
+            result: SearchResult = await parser.search(
+                query,
+                max_pages=settings["max_pages"],
+                max_check=settings["max_check"],
+                category_path=CATEGORY_OPTIONS[settings["category_key"]]["path"],
+                city_filter=settings["city_filter"],
+                review_filter=settings["review_filter"],
+                progress_callback=on_progress,
+            )
 
-        await _show_search_result(message, requester_id, status_msg, query, settings, result)
+            fresh_listings, skipped_seen = db.filter_new_listings(
+                requester_id,
+                search_key,
+                result.listings,
+                config.SEEN_LINK_TTL_HOURS,
+            )
+            result.stats.already_seen_skipped = skipped_seen
+            result.stats.listings_matched = len(fresh_listings)
+            logger.info(
+                "[DEDUPE] user=%s key=%r matched=%d new=%d skipped_seen=%d ttl_hours=%d",
+                requester_id,
+                search_key,
+                len(result.listings),
+                len(fresh_listings),
+                skipped_seen,
+                config.SEEN_LINK_TTL_HOURS,
+            )
+            result = SearchResult(listings=fresh_listings, stats=result.stats)
+
+            await _show_search_result(message, requester_id, status_msg, query, settings, result)
     except Exception:
         logger.exception("Search failed | query=%s | user=%s", query, requester_id)
         try:
@@ -1488,7 +1533,16 @@ def _build_status_text(query: str, settings: dict, progress: dict | None = None)
         )
         return "\n\n".join([header, scenario, phase_block])
 
-    if progress["phase"] == "collect":
+    if progress["phase"] == "queue":
+        phase_block = _build_block(
+            "Очередь",
+            [
+                "Стадия: <b>ожидание свободного слота</b>",
+                "Прогресс: <code>░░░░░░░░░░</code>",
+                "Поиск поставлен в очередь и стартует автоматически.",
+            ],
+        )
+    elif progress["phase"] == "collect":
         progress_bar = _progress_bar(progress["page"], settings["max_pages"])
         phase_block = _build_block(
             "Сбор объявлений",

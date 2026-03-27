@@ -64,6 +64,29 @@ _SELLER_BUSINESS_RE = re.compile(
     re.IGNORECASE,
 )
 _VISIBLE_TEXT_SKIP_TAGS = {"script", "style", "noscript", "svg", "path", "meta", "link", "head", "title"}
+_SELLER_BLOCK_HINTS = ("seller", "user", "profile", "contact", "owner", "account")
+_SELLER_NAME_EXCLUDE_PREFIXES = (
+    "persoana fizica",
+    "private",
+    "privat",
+    "firma",
+    "companie",
+    "company",
+    "business",
+    "contacteaza vanzatorul",
+    "trimite mesaj",
+    "pe olx din",
+    "activ ",
+    "olx business",
+    "academia de business",
+    "returneaza produsul",
+    "contacteaza vanzatorul direct",
+    "arata",
+)
+_MONTH_YEAR_RE = re.compile(
+    r"^(?:ianuarie|februarie|martie|aprilie|mai|iunie|iulie|august|septembrie|octombrie|noiembrie|decembrie)\s+\d{4}$",
+    re.IGNORECASE,
+)
 
 _REVIEW_KEYS = {
     "reviewcount",
@@ -516,10 +539,10 @@ class OLXParser:
                 if text:
                     return text
 
-        full_text = soup.get_text(" ", strip=True)
-        match = _ONLINE_EXTRACT_RE.search(full_text)
-        if match:
-            return match.group(0)
+        for text in self._collect_seller_context_texts(soup):
+            match = _ONLINE_EXTRACT_RE.search(text)
+            if match:
+                return match.group(0)
         return None
 
     def _parse_seller_name(self, soup: BeautifulSoup) -> Optional[str]:
@@ -543,6 +566,21 @@ class OLXParser:
                 if text:
                     return text
 
+        for text in self._collect_seller_context_texts(soup):
+            normalized = self._normalize_match_text(text)
+            if not normalized:
+                continue
+            if any(normalized.startswith(prefix) for prefix in _SELLER_NAME_EXCLUDE_PREFIXES):
+                continue
+            if _MONTH_YEAR_RE.fullmatch(normalized):
+                continue
+            if any(char.isdigit() for char in normalized):
+                continue
+            if len(text) > 40:
+                continue
+            if re.fullmatch(r"[A-Za-zА-Яа-яÀ-ÿ .'\-]+", text):
+                return text.strip()
+
         # Fallback: seller card often contains a short proper-name line near the rating block.
         candidates = soup.find_all(["h4", "h5", "h6", "span", "div"])
         for element in candidates:
@@ -557,6 +595,104 @@ class OLXParser:
                 if "activ" in parent_text or "rating" in parent_text or "olx din" in parent_text:
                     return text.strip()
         return None
+
+    def _iter_seller_blocks(self, soup: BeautifulSoup):
+        seen: set[int] = set()
+        for element in soup.find_all(True):
+            hints: list[str] = []
+            data_testid = element.get("data-testid")
+            if data_testid:
+                hints.append(str(data_testid))
+            element_id = element.get("id")
+            if element_id:
+                hints.append(str(element_id))
+            classes = element.get("class") or []
+            if classes:
+                hints.append(" ".join(str(value) for value in classes))
+
+            if not hints:
+                continue
+
+            normalized = self._normalize_match_text(" ".join(hints))
+            if not any(hint in normalized for hint in _SELLER_BLOCK_HINTS):
+                continue
+
+            marker = id(element)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            yield element
+
+    def _collect_text_chunks_from_element(
+        self,
+        element: Any,
+        *,
+        limit: Optional[int] = None,
+        seen: Optional[set[str]] = None,
+    ) -> list[str]:
+        chunks: list[str] = []
+        known = seen if seen is not None else set()
+
+        for text_node in element.find_all(string=True):
+            parent = getattr(text_node, "parent", None)
+            parent_name = getattr(parent, "name", "")
+            if parent_name in _VISIBLE_TEXT_SKIP_TAGS:
+                continue
+
+            text = re.sub(r"\s+", " ", str(text_node)).strip()
+            if not text:
+                continue
+
+            normalized = self._normalize_match_text(text)
+            if not normalized or normalized in known:
+                continue
+
+            known.add(normalized)
+            chunks.append(text[:220])
+            if limit and len(chunks) >= limit:
+                break
+
+        return chunks
+
+    def _collect_seller_context_texts(self, soup: BeautifulSoup, limit: int = 80) -> list[str]:
+        snippets: list[str] = []
+        seen: set[str] = set()
+
+        for block in self._iter_seller_blocks(soup):
+            for text in self._collect_text_chunks_from_element(block, seen=seen):
+                snippets.append(text)
+                if len(snippets) >= limit:
+                    return snippets
+
+        if snippets:
+            return snippets
+
+        for text in self._visible_text_chunks(soup, limit=300):
+            normalized_text = self._normalize_match_text(text)
+            if any(
+                token in normalized_text
+                for token in (
+                    "privat",
+                    "persoana fizica",
+                    "firma",
+                    "companie",
+                    "business",
+                    "company",
+                    "ratinguri",
+                    "rating",
+                    "review",
+                    "evaluari",
+                    "feedback",
+                    "olx din",
+                    "activ azi",
+                    "activ acum",
+                    "contacteaza vanzatorul",
+                )
+            ):
+                snippets.append(text[:220])
+            if len(snippets) >= limit:
+                break
+        return snippets
 
     def _visible_text_chunks(self, soup: BeautifulSoup, limit: Optional[int] = None) -> list[str]:
         chunks: list[str] = []
@@ -622,7 +758,7 @@ class OLXParser:
         if seller_type:
             return seller_type
 
-        visible_texts = self._visible_text_chunks(soup, limit=250)
+        visible_texts = self._collect_seller_context_texts(soup, limit=120)
         account_texts = [
             text
             for text in visible_texts
@@ -634,16 +770,50 @@ class OLXParser:
     def _parse_seller_rating_value(self, soup: BeautifulSoup) -> Optional[str]:
         data = self._get_nextdata(soup)
         if data:
-            rating = self._find_seller_rating_value(data)
-            if rating is not None:
-                return rating
+            for payload in self._iter_seller_payloads(data):
+                rating = self._find_seller_rating_value(payload)
+                if rating is not None:
+                    return rating
 
-        full_text = soup.get_text(" ", strip=True)
-        normalized = self._normalize_match_text(full_text)
-        match = _SELLER_RATING_VALUE_RE.search(normalized)
-        if match:
-            return match.group(1).replace(",", ".")
+        for text in self._collect_seller_context_texts(soup, limit=80):
+            normalized = self._normalize_match_text(text)
+            match = _SELLER_RATING_VALUE_RE.search(normalized)
+            if match:
+                return match.group(1).replace(",", ".")
         return None
+
+    def _iter_seller_payloads(self, data: dict) -> list[Any]:
+        payloads: list[Any] = []
+        try:
+            page_props = data["props"]["pageProps"]
+        except (KeyError, TypeError):
+            return payloads
+
+        candidates: list[Any] = []
+        if isinstance(page_props, dict):
+            ad = page_props.get("ad") or {}
+            if isinstance(ad, dict):
+                candidates.extend(
+                    [
+                        ad.get("user"),
+                        ad.get("seller"),
+                        ad.get("sellerProfile"),
+                        ad.get("contact"),
+                    ]
+                )
+            candidates.extend(
+                [
+                    page_props.get("user"),
+                    page_props.get("seller"),
+                    page_props.get("sellerProfile"),
+                    page_props.get("contact"),
+                ]
+            )
+
+        for item in candidates:
+            if item is not None:
+                payloads.append(item)
+        return payloads
 
     def _find_seller_rating_value(self, obj: Any) -> Optional[str]:
         if isinstance(obj, dict):
@@ -686,7 +856,7 @@ class OLXParser:
 
     def _collect_seller_texts(self, soup: BeautifulSoup) -> list[str]:
         snippets: list[str] = []
-        for text in self._visible_text_chunks(soup, limit=300):
+        for text in self._collect_seller_context_texts(soup, limit=120):
             normalized_text = self._normalize_match_text(text)
             if any(
                 token in normalized_text
@@ -783,29 +953,16 @@ class OLXParser:
         if count is not None:
             return count, "review_nodes", count > 0, count == 0
 
-        count = self._extract_reviews_count_from_texts(self._collect_seller_texts(soup))
+        seller_texts = self._collect_seller_texts(soup)
+        count = self._extract_reviews_count_from_texts(seller_texts)
         if count is not None:
             return count, "seller_text", count > 0, count == 0
 
-        count = self._extract_reviews_count_from_scripts(soup)
-        if count is not None:
-            return count, "scripts", count > 0, count == 0
-
-        full_text = self._normalize_match_text(" ".join(self._visible_text_chunks(soup, limit=600)))
-        match = _REVIEWS_RE.search(full_text)
-        if match:
-            count = int(match.group(1))
-            return count, "page_text", count > 0, count == 0
-
-        if _NO_REVIEWS_RE.search(full_text):
-            return 0, "page_text_zero", False, True
-
-        seller_texts = self._collect_seller_texts(soup)
         if self._has_generic_reviews_signal(seller_texts):
             return None, "seller_text_signal", True, False
 
         if seller_rating:
-            return None, "rating_fallback", True, False
+            return None, "seller_rating", True, False
         return None, "unknown", False, False
 
     def _extract_reviews_count_from_texts(self, texts: list[str]) -> Optional[int]:
@@ -834,28 +991,23 @@ class OLXParser:
         data = self._get_nextdata(soup)
         if not data:
             return None
-        try:
-            page_props = data["props"]["pageProps"]
-        except (KeyError, TypeError):
-            page_props = None
-
-        if page_props is not None:
-            count = self._find_reviews_count(page_props)
+        for payload in self._iter_seller_payloads(data):
+            count = self._find_reviews_count(payload)
             if count is not None:
                 return count
-
-        return self._find_reviews_count(data)
+        return None
 
     def _extract_reviews_count_from_review_nodes(self, soup: BeautifulSoup) -> Optional[int]:
-        for element in soup.find_all(attrs={"data-testid": re.compile(r"(review|rating|feedback)", re.IGNORECASE)}):
-            text = self._normalize_match_text(element.get_text(" ", strip=True))
-            if not text:
-                continue
-            match = _REVIEWS_RE.search(text)
-            if match:
-                return int(match.group(1))
-            if _NO_REVIEWS_RE.search(text):
-                return 0
+        for block in self._iter_seller_blocks(soup):
+            for element in block.find_all(attrs={"data-testid": re.compile(r"(review|rating|feedback)", re.IGNORECASE)}):
+                text = self._normalize_match_text(element.get_text(" ", strip=True))
+                if not text:
+                    continue
+                match = _REVIEWS_RE.search(text)
+                if match:
+                    return int(match.group(1))
+                if _NO_REVIEWS_RE.search(text):
+                    return 0
         return None
 
     def _extract_reviews_count_from_scripts(self, soup: BeautifulSoup) -> Optional[int]:
