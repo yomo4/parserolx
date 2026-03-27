@@ -1,13 +1,12 @@
 """
-Telegram-бот для парсинга OLX.ro.
-Принимает поисковый запрос и перед запуском показывает
-инлайн-настройки парсинга, включая выбор категории.
+Telegram bot for OLX.ro parsing with subscriptions, admin tools, and inline UI.
 """
 
 import asyncio
 import logging
 import time
 from html import escape
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, StateFilter
@@ -20,10 +19,12 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InputMediaPhoto,
     Message,
+    User,
 )
 from aiogram.utils.markdown import hbold, hcode
 
 import config
+from database import BotDatabase, iso_to_dt, utc_now
 from olx_parser import OLXParser, SearchResult
 
 
@@ -37,47 +38,25 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 parser = OLXParser()
+db = BotDatabase(config.DB_PATH)
+
 
 REVIEW_FILTER_LABELS = {
     "any": "любые",
     "with": "только с отзывами",
-    "without": "без отзывов",
+    "without": "только без подтвержденных отзывов",
 }
 
 CATEGORY_OPTIONS = {
     "all": {"label": "Все категории", "path": ""},
-    "electronics": {
-        "label": "Электроника",
-        "path": "electronice-si-electrocasnice",
-    },
-    "auto": {
-        "label": "Авто",
-        "path": "auto-masini-moto-ambarcatiuni",
-    },
-    "realty": {
-        "label": "Недвижимость",
-        "path": "imobiliare",
-    },
-    "jobs": {
-        "label": "Работа",
-        "path": "locuri-de-munca",
-    },
-    "home": {
-        "label": "Дом и сад",
-        "path": "casa-gradina",
-    },
-    "kids": {
-        "label": "Мама и ребенок",
-        "path": "mama-si-copilul",
-    },
-    "pets": {
-        "label": "Животные",
-        "path": "animale-de-companie",
-    },
-    "fashion": {
-        "label": "Мода",
-        "path": "moda-frumusete",
-    },
+    "electronics": {"label": "Электроника", "path": "electronice-si-electrocasnice"},
+    "auto": {"label": "Авто", "path": "auto-masini-moto-ambarcatiuni"},
+    "realty": {"label": "Недвижимость", "path": "imobiliare"},
+    "jobs": {"label": "Работа", "path": "locuri-de-munca"},
+    "home": {"label": "Дом и сад", "path": "casa-gradina"},
+    "kids": {"label": "Мама и ребенок", "path": "mama-si-copilul"},
+    "pets": {"label": "Животные", "path": "animale-de-companie"},
+    "fashion": {"label": "Мода", "path": "moda-frumusete"},
 }
 
 
@@ -89,6 +68,7 @@ def _option_values(default_value: int, preset_values: tuple[int, ...]) -> tuple[
 
 CHECK_OPTIONS = _option_values(config.MAX_LISTINGS_CHECK, (10, 20, 30, 50))
 PAGE_OPTIONS = _option_values(config.MAX_PAGES, (1, 2, 3, 5))
+ADMIN_CODE_DURATIONS = (7, 30, 90, 365)
 
 
 class SearchState(StatesGroup):
@@ -96,194 +76,184 @@ class SearchState(StatesGroup):
     configuring_search = State()
 
 
-@dp.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await message.answer(
-        f"👋 {hbold('OLX.ro Parser Bot')}\n\n"
-        "Отправьте ключевое слово для поиска.\n"
-        "После этого бот покажет инлайн-настройки:\n"
-        "категорию, глубину парсинга, страницы поиска и фильтр по отзывам.\n\n"
-        f"Пример: {hcode('iPhone 14')} или {hcode('laptop asus')}\n\n"
-        "Команды:\n"
-        "/search — ввести запрос\n"
-        "/help — помощь\n"
-        "/cancel — отменить текущее действие",
-        parse_mode="HTML",
+class SubscriptionState(StatesGroup):
+    waiting_code = State()
+
+
+class AdminState(StatesGroup):
+    waiting_broadcast = State()
+
+
+def _sync_user(user: Optional[User]) -> None:
+    if not user:
+        return
+    db.upsert_user(
+        user_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name,
     )
 
 
-@dp.message(Command("help"))
-async def cmd_help(message: Message) -> None:
-    await message.answer(
-        f"{hbold('ℹ️ Как пользоваться ботом:')}\n\n"
-        "1. Отправьте поисковый запрос\n"
-        "2. Выберите инлайн-настройки парсинга\n"
-        "3. Нажмите «Запустить парсинг»\n"
-        "4. Бот соберет объявления и проверит продавцов на онлайн сегодня\n\n"
-        f"{hbold('Что можно настроить:')}\n"
-        "• категорию OLX\n"
-        "• сколько объявлений дополнительно проверять\n"
-        "• сколько страниц поиска OLX просматривать\n"
-        "• брать любых продавцов, только с отзывами или без отзывов\n\n"
-        f"{hbold('Статус «онлайн сегодня» включает:')}\n"
-        "• Activ acum\n"
-        "• Activ azi\n"
-        "• Activ la HH:MM\n\n"
-        f"{hbold('Текущие дефолты:')}\n"
-        f"• Категория: {CATEGORY_OPTIONS['all']['label']}\n"
-        f"• Страниц поиска: {config.MAX_PAGES}\n"
-        f"• Объявлений на проверку: {config.MAX_LISTINGS_CHECK}\n"
-        f"• Результатов в выдаче: до {config.MAX_RESULTS}",
-        parse_mode="HTML",
+def _is_admin(user_id: int) -> bool:
+    return user_id in config.ADMIN_IDS
+
+
+def _has_access(user_id: int) -> bool:
+    return _is_admin(user_id) or db.has_active_subscription(user_id)
+
+
+def _format_datetime(value: Optional[str]) -> str:
+    dt = iso_to_dt(value)
+    if not dt:
+        return "не указано"
+    return dt.astimezone().strftime("%d.%m.%Y %H:%M")
+
+
+def _format_subscription_value(user_id: int) -> str:
+    user = db.get_user(user_id) or {}
+    expires_at = iso_to_dt(user.get("subscription_until"))
+    if not expires_at:
+        return "не активна"
+    now = utc_now()
+    if expires_at <= now:
+        return f"истекла {_format_datetime(user.get('subscription_until'))}"
+    remaining = expires_at - now
+    days = remaining.days
+    hours = remaining.seconds // 3600
+    return f"активна до {_format_datetime(user.get('subscription_until'))} ({days}д {hours}ч)"
+
+
+def _build_home_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="👤 Профиль", callback_data="menu:profile"),
+            InlineKeyboardButton(text="🚀 Начать парс", callback_data="menu:start"),
+        ],
+        [InlineKeyboardButton(text="💳 Моя подписка", callback_data="menu:subscription")],
+    ]
+    if _is_admin(user_id):
+        rows.append([InlineKeyboardButton(text="🛠 Админ", callback_data="menu:admin")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _build_profile_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="🔑 Подписка", callback_data="menu:enter_code"),
+            InlineKeyboardButton(text="💳 Моя подписка", callback_data="menu:subscription"),
+        ],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:home")],
+    ]
+    if _is_admin(user_id):
+        rows.insert(1, [InlineKeyboardButton(text="🛠 Админ", callback_data="menu:admin")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _build_subscription_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="🔑 Ввести код", callback_data="menu:enter_code")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:home")],
+    ]
+    if _is_admin(user_id):
+        rows.insert(1, [InlineKeyboardButton(text="🛠 Админ", callback_data="menu:admin")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _build_admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Код 7 дней", callback_data="admin:gen:7"),
+                InlineKeyboardButton(text="Код 30 дней", callback_data="admin:gen:30"),
+            ],
+            [
+                InlineKeyboardButton(text="Код 90 дней", callback_data="admin:gen:90"),
+                InlineKeyboardButton(text="Код 365 дней", callback_data="admin:gen:365"),
+            ],
+            [
+                InlineKeyboardButton(text="📢 Рассылка", callback_data="admin:broadcast"),
+                InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats"),
+            ],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")],
+        ]
     )
 
 
-@dp.message(Command("cancel"))
-async def cmd_cancel(message: Message, state: FSMContext) -> None:
-    current = await state.get_state()
-    await state.clear()
-    if current:
-        await message.answer("❌ Действие отменено.")
-    else:
-        await message.answer("Нет активного действия.")
-
-
-@dp.message(Command("search"))
-async def cmd_search(message: Message, state: FSMContext) -> None:
-    await state.set_state(SearchState.waiting_query)
-    await message.answer("🔎 Введите поисковый запрос:")
-
-
-@dp.message(SearchState.waiting_query, F.text & ~F.text.startswith("/"))
-async def handle_search_state(message: Message, state: FSMContext) -> None:
-    await _open_search_settings(message, state, (message.text or "").strip())
-
-
-@dp.message(SearchState.configuring_search, F.text & ~F.text.startswith("/"))
-async def handle_new_query_during_config(message: Message, state: FSMContext) -> None:
-    await _open_search_settings(message, state, (message.text or "").strip())
-
-
-@dp.message(StateFilter(None), F.text & ~F.text.startswith("/"))
-async def handle_text(message: Message, state: FSMContext) -> None:
-    await _open_search_settings(message, state, (message.text or "").strip())
-
-
-@dp.callback_query(F.data.startswith("cfg:"))
-async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.message:
-        await callback.answer()
-        return
-
-    current_state = await state.get_state()
-    if current_state != SearchState.configuring_search.state:
-        await callback.answer("Настройки уже устарели. Отправьте запрос заново.", show_alert=True)
-        return
-
-    data = await state.get_data()
-    query = data.get("query", "")
-    if not query:
-        await state.clear()
-        await callback.answer("Запрос не найден. Отправьте его заново.", show_alert=True)
-        return
-
-    parts = callback.data.split(":")
-    action = parts[1]
-
-    if action == "cancel":
-        await state.clear()
-        await callback.message.edit_text("❌ Поиск отменен.")
-        await callback.answer()
-        return
-
-    if action == "start":
-        settings = _extract_settings(data)
-        logger.info(
-            "[UI] Запуск поиска | chat=%s | user=%s | query=%r | settings=%s",
-            callback.message.chat.id,
-            callback.from_user.id,
-            query,
-            settings,
-        )
-        await state.clear()
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        await callback.answer("Запускаю парсинг...")
-        await run_search(callback.message, query, settings)
-        return
-
-    if action == "check" and len(parts) == 3:
-        await state.update_data(max_check=int(parts[2]))
-    elif action == "pages" and len(parts) == 3:
-        await state.update_data(max_pages=int(parts[2]))
-    elif action == "reviews" and len(parts) == 3:
-        await state.update_data(review_filter=parts[2])
-    elif action == "category" and len(parts) == 3 and parts[2] in CATEGORY_OPTIONS:
-        await state.update_data(category_key=parts[2])
-    else:
-        await callback.answer()
-        return
-
-    updated_data = await state.get_data()
-    settings = _extract_settings(updated_data)
-    logger.info(
-        "[UI] Обновлены настройки | chat=%s | user=%s | query=%r | settings=%s",
-        callback.message.chat.id,
-        callback.from_user.id,
-        query,
-        settings,
+def _home_text(user_id: int) -> str:
+    user = db.get_user(user_id) or {}
+    username = f"@{user['username']}" if user.get("username") else "не указан"
+    return (
+        "👋 <b>OLX.ro Parser Bot</b>\n\n"
+        f"Профиль: <b>{escape(user.get('full_name') or 'Пользователь')}</b>\n"
+        f"Username: <b>{escape(username)}</b>\n"
+        f"Подписка: <b>{escape(_format_subscription_value(user_id))}</b>\n\n"
+        "Выберите действие ниже. Поиск доступен только с активной подпиской."
     )
 
+
+def _profile_text(user_id: int) -> str:
+    user = db.get_user(user_id) or {}
+    username = f"@{user['username']}" if user.get("username") else "не указан"
+    last_query = escape(user.get("last_query") or "нет")
+    return (
+        "👤 <b>Профиль</b>\n\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"Имя: <b>{escape(user.get('full_name') or 'не указано')}</b>\n"
+        f"Username: <b>{escape(username)}</b>\n"
+        f"Регистрация: <b>{escape(_format_datetime(user.get('created_at')))}</b>\n"
+        f"Последняя активность: <b>{escape(_format_datetime(user.get('last_seen_at')))}</b>\n"
+        f"Поисков выполнено: <b>{user.get('total_searches', 0)}</b>\n"
+        f"Последний запрос: <code>{last_query}</code>\n"
+        f"Подписка: <b>{escape(_format_subscription_value(user_id))}</b>"
+    )
+
+
+def _subscription_text(user_id: int) -> str:
+    user = db.get_user(user_id) or {}
+    redeemed_code = user.get("redeemed_code") or "еще не активировали"
+    return (
+        "💳 <b>Моя подписка</b>\n\n"
+        f"Статус: <b>{escape(_format_subscription_value(user_id))}</b>\n"
+        f"Последний код: <code>{escape(redeemed_code)}</code>\n\n"
+        "Нажмите <b>Ввести код</b>, чтобы активировать или продлить подписку."
+    )
+
+
+def _admin_text(admin_id: int) -> str:
+    stats = db.get_stats()
+    return (
+        "🛠 <b>Админ-панель</b>\n\n"
+        f"Админ ID: <code>{admin_id}</code>\n"
+        f"Пользователей: <b>{stats['total_users']}</b>\n"
+        f"Активных подписок: <b>{stats['active_subscriptions']}</b>\n"
+        f"Всего кодов: <b>{stats['total_codes']}</b>\n"
+        f"Доступных кодов: <b>{stats['available_codes']}</b>\n"
+        f"Использовано кодов: <b>{stats['redeemed_codes']}</b>\n"
+        f"Рассылок: <b>{stats['total_broadcasts']}</b>\n\n"
+        "Выберите действие ниже."
+    )
+
+
+async def _show_panel(message: Message, text: str, reply_markup: InlineKeyboardMarkup) -> None:
     try:
-        await callback.message.edit_text(
-            _build_settings_text(query, settings),
-            parse_mode="HTML",
-            reply_markup=_build_settings_keyboard(settings),
-        )
+        await message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
     except Exception:
-        logger.exception("Не удалось обновить сообщение с настройками")
-    await callback.answer("Настройки обновлены")
+        await message.answer(text, parse_mode="HTML", reply_markup=reply_markup)
 
 
-async def _open_search_settings(message: Message, state: FSMContext, query: str) -> None:
-    if len(query) < 2:
-        await message.answer("❗ Запрос слишком короткий. Введите минимум 2 символа.")
-        return
-
-    existing = await state.get_data()
-    old_message_id = existing.get("settings_message_id")
-    if old_message_id:
-        try:
-            await bot.delete_message(message.chat.id, old_message_id)
-        except Exception:
-            pass
-
-    settings = {
-        "category_key": existing.get("category_key", "all"),
-        "max_check": existing.get("max_check", config.MAX_LISTINGS_CHECK),
-        "max_pages": existing.get("max_pages", config.MAX_PAGES),
-        "review_filter": existing.get("review_filter", "any"),
-    }
-
-    await state.set_state(SearchState.configuring_search)
-    await state.update_data(query=query, **settings)
-
-    sent = await message.answer(
-        _build_settings_text(query, settings),
+async def _send_home(message: Message, user_id: int) -> None:
+    await message.answer(
+        _home_text(user_id),
         parse_mode="HTML",
-        reply_markup=_build_settings_keyboard(settings),
+        reply_markup=_build_home_keyboard(user_id),
     )
-    await state.update_data(settings_message_id=sent.message_id)
 
-    logger.info(
-        "[UI] Открыты настройки | chat=%s | user=%s | query=%r | settings=%s",
-        message.chat.id,
-        message.from_user.id if message.from_user else "unknown",
-        query,
-        settings,
+
+def _subscription_required_text() -> str:
+    return (
+        "🔒 <b>Доступ к парсингу закрыт</b>\n\n"
+        "Чтобы начать поиск, активируйте подписку кодом в разделе <b>Моя подписка</b>."
     )
 
 
@@ -291,11 +261,14 @@ def _extract_settings(data: dict) -> dict:
     category_key = str(data.get("category_key", "all"))
     if category_key not in CATEGORY_OPTIONS:
         category_key = "all"
+    review_filter = str(data.get("review_filter", "any"))
+    if review_filter not in REVIEW_FILTER_LABELS:
+        review_filter = "any"
     return {
         "category_key": category_key,
         "max_check": int(data.get("max_check", config.MAX_LISTINGS_CHECK)),
         "max_pages": int(data.get("max_pages", config.MAX_PAGES)),
-        "review_filter": str(data.get("review_filter", "any")),
+        "review_filter": review_filter,
     }
 
 
@@ -307,7 +280,7 @@ def _build_settings_text(query: str, settings: dict) -> str:
         f"Объявлений на проверку: <b>{settings['max_check']}</b>\n"
         f"Страниц поиска: <b>{settings['max_pages']}</b>\n"
         f"Отзывы: <b>{REVIEW_FILTER_LABELS[settings['review_filter']]}</b>\n\n"
-        "Выберите параметры ниже и нажмите <b>«Запустить парсинг»</b>."
+        "Фильтр по отзывам работает только по подтвержденным данным, чтобы уменьшить ложные отсечки."
     )
 
 
@@ -335,10 +308,7 @@ def _build_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
                 callback_data="cfg:category:auto",
             ),
             InlineKeyboardButton(
-                text=mark(
-                    settings["category_key"] == "realty",
-                    CATEGORY_OPTIONS["realty"]["label"],
-                ),
+                text=mark(settings["category_key"] == "realty", CATEGORY_OPTIONS["realty"]["label"]),
                 callback_data="cfg:category:realty",
             ),
         ],
@@ -364,12 +334,9 @@ def _build_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(
-                text=mark(
-                    settings["category_key"] == "fashion",
-                    CATEGORY_OPTIONS["fashion"]["label"],
-                ),
+                text=mark(settings["category_key"] == "fashion", CATEGORY_OPTIONS["fashion"]["label"]),
                 callback_data="cfg:category:fashion",
-            )
+            ),
         ],
         [
             InlineKeyboardButton(
@@ -404,7 +371,453 @@ def _build_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def run_search(message: Message, query: str, settings: dict) -> None:
+@dp.message(Command("start"))
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    _sync_user(message.from_user)
+    await state.clear()
+    await message.answer(
+        _home_text(message.from_user.id),
+        parse_mode="HTML",
+        reply_markup=_build_home_keyboard(message.from_user.id),
+    )
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message, state: FSMContext) -> None:
+    _sync_user(message.from_user)
+    await state.clear()
+    await message.answer(
+        f"{hbold('Как пользоваться ботом:')}\n\n"
+        "1. Откройте профиль или раздел подписки\n"
+        "2. Активируйте код подписки\n"
+        "3. Нажмите «Начать парс»\n"
+        "4. Введите запрос и настройте категорию, страницы, количество объявлений и фильтр отзывов\n"
+        "5. Бот соберет объявления и покажет только подходящие результаты\n\n"
+        f"{hbold('Важно по фильтру отзывов:')}\n"
+        "• «с отзывами» пропускает только продавцов с подтвержденным количеством отзывов > 0\n"
+        "• «без отзывов» пропускает только продавцов, где явно найдено 0 отзывов\n"
+        "• если отзывы не удалось определить, бот не будет ошибочно считать их отсутствующими\n\n"
+        f"{hbold('Команды:')}\n"
+        "/start — главное меню\n"
+        "/search — начать поиск\n"
+        "/admin — админ-панель\n"
+        "/cancel — отменить текущее действие",
+        parse_mode="HTML",
+        reply_markup=_build_home_keyboard(message.from_user.id),
+    )
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    _sync_user(message.from_user)
+    current = await state.get_state()
+    await state.clear()
+    if current:
+        await message.answer("❌ Текущее действие отменено.")
+    else:
+        await message.answer("Нет активного действия.")
+    await _send_home(message, message.from_user.id)
+
+
+@dp.message(Command("search"))
+async def cmd_search(message: Message, state: FSMContext) -> None:
+    _sync_user(message.from_user)
+    if not _has_access(message.from_user.id):
+        await message.answer(
+            _subscription_required_text(),
+            parse_mode="HTML",
+            reply_markup=_build_subscription_keyboard(message.from_user.id),
+        )
+        return
+    await state.set_state(SearchState.waiting_query)
+    await message.answer("🔎 Введите поисковый запрос:")
+
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext) -> None:
+    _sync_user(message.from_user)
+    await state.clear()
+    if not _is_admin(message.from_user.id):
+        await message.answer("У вас нет доступа к админ-панели.")
+        return
+    await message.answer(
+        _admin_text(message.from_user.id),
+        parse_mode="HTML",
+        reply_markup=_build_admin_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("menu:"))
+async def handle_menu_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+
+    _sync_user(callback.from_user)
+    action = callback.data.split(":", maxsplit=1)[1]
+
+    if action in {"home", "profile", "subscription", "admin"}:
+        await state.clear()
+
+    if action == "home":
+        await _show_panel(
+            callback.message,
+            _home_text(callback.from_user.id),
+            _build_home_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+
+    if action == "profile":
+        await _show_panel(
+            callback.message,
+            _profile_text(callback.from_user.id),
+            _build_profile_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+
+    if action == "subscription":
+        await _show_panel(
+            callback.message,
+            _subscription_text(callback.from_user.id),
+            _build_subscription_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+
+    if action == "enter_code":
+        await state.clear()
+        await state.set_state(SubscriptionState.waiting_code)
+        await callback.message.answer(
+            "🔑 Отправьте код подписки одним сообщением.\n\n"
+            f"Пример: {hcode('OLX-ABCD@7K9Q')}",
+            parse_mode="HTML",
+        )
+        await callback.answer("Жду код подписки")
+        return
+
+    if action == "start":
+        await state.clear()
+        if not _has_access(callback.from_user.id):
+            await _show_panel(
+                callback.message,
+                _subscription_required_text(),
+                _build_subscription_keyboard(callback.from_user.id),
+            )
+            await callback.answer("Нужна активная подписка", show_alert=True)
+            return
+        await state.set_state(SearchState.waiting_query)
+        await callback.message.answer("🔎 Введите поисковый запрос:")
+        await callback.answer()
+        return
+
+    if action == "admin":
+        if not _is_admin(callback.from_user.id):
+            await callback.answer("Нет доступа", show_alert=True)
+            return
+        await _show_panel(
+            callback.message,
+            _admin_text(callback.from_user.id),
+            _build_admin_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin:"))
+async def handle_admin_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+
+    _sync_user(callback.from_user)
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    action = parts[1]
+
+    if action == "stats":
+        await state.clear()
+        await _show_panel(callback.message, _admin_text(callback.from_user.id), _build_admin_keyboard())
+        await callback.answer("Статистика обновлена")
+        return
+
+    if action == "broadcast":
+        await state.clear()
+        await state.set_state(AdminState.waiting_broadcast)
+        await callback.message.answer(
+            "📢 Отправьте следующим сообщением текст рассылки для всех пользователей.\n"
+            "Команда /cancel отменит рассылку."
+        )
+        await callback.answer("Жду текст рассылки")
+        return
+
+    if action == "gen" and len(parts) == 3 and parts[2].isdigit():
+        duration_days = int(parts[2])
+        if duration_days not in ADMIN_CODE_DURATIONS:
+            await callback.answer("Неизвестный срок", show_alert=True)
+            return
+        code = db.generate_subscription_code(duration_days=duration_days, created_by=callback.from_user.id)
+        await callback.message.answer(
+            f"✅ Код создан\n\n"
+            f"Срок: <b>{duration_days} дней</b>\n"
+            f"Код: <code>{code}</code>",
+            parse_mode="HTML",
+        )
+        await callback.answer("Код создан")
+        return
+
+    await callback.answer()
+
+
+@dp.message(AdminState.waiting_broadcast, F.text & ~F.text.startswith("/"))
+async def handle_admin_broadcast(message: Message, state: FSMContext) -> None:
+    _sync_user(message.from_user)
+    if not _is_admin(message.from_user.id):
+        await state.clear()
+        await message.answer("У вас нет доступа к рассылке.")
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Пустая рассылка не отправлена.")
+        return
+
+    await state.clear()
+
+    delivered = 0
+    failed = 0
+    user_ids = db.list_user_ids()
+    logger.info("[ADMIN] Broadcast start | admin=%s | users=%d", message.from_user.id, len(user_ids))
+
+    for user_id in user_ids:
+        try:
+            await bot.send_message(user_id, text)
+            delivered += 1
+            await asyncio.sleep(0.04)
+        except Exception:
+            failed += 1
+            logger.exception("[ADMIN] Broadcast failed | target=%s", user_id)
+
+    db.log_broadcast(
+        admin_id=message.from_user.id,
+        message_text=text,
+        delivered_count=delivered,
+        failed_count=failed,
+    )
+
+    await message.answer(
+        f"📢 Рассылка завершена.\n\n"
+        f"Успешно: <b>{delivered}</b>\n"
+        f"Ошибок: <b>{failed}</b>",
+        parse_mode="HTML",
+        reply_markup=_build_admin_keyboard(),
+    )
+
+
+@dp.message(SubscriptionState.waiting_code, F.text & ~F.text.startswith("/"))
+async def handle_subscription_code(message: Message, state: FSMContext) -> None:
+    _sync_user(message.from_user)
+    code = (message.text or "").strip()
+    success, status_text, expires_at = db.redeem_subscription_code(message.from_user.id, code)
+    await state.clear()
+
+    if success and expires_at:
+        logger.info("[SUB] Code redeemed | user=%s | code=%s | until=%s", message.from_user.id, code, expires_at)
+        await message.answer(
+            f"✅ {status_text}\n"
+            f"Подписка активна до <b>{escape(_format_datetime(expires_at.isoformat()))}</b>.",
+            parse_mode="HTML",
+        )
+    else:
+        logger.info("[SUB] Code redeem failed | user=%s | code=%s | reason=%s", message.from_user.id, code, status_text)
+        await message.answer(f"❌ {status_text}")
+
+    await message.answer(
+        _subscription_text(message.from_user.id),
+        parse_mode="HTML",
+        reply_markup=_build_subscription_keyboard(message.from_user.id),
+    )
+
+
+@dp.message(SearchState.waiting_query, F.text & ~F.text.startswith("/"))
+async def handle_search_state(message: Message, state: FSMContext) -> None:
+    _sync_user(message.from_user)
+    if not _has_access(message.from_user.id):
+        await state.clear()
+        await message.answer(
+            _subscription_required_text(),
+            parse_mode="HTML",
+            reply_markup=_build_subscription_keyboard(message.from_user.id),
+        )
+        return
+    await _open_search_settings(message, state, (message.text or "").strip())
+
+
+@dp.message(SearchState.configuring_search, F.text & ~F.text.startswith("/"))
+async def handle_new_query_during_config(message: Message, state: FSMContext) -> None:
+    _sync_user(message.from_user)
+    if not _has_access(message.from_user.id):
+        await state.clear()
+        await message.answer(
+            _subscription_required_text(),
+            parse_mode="HTML",
+            reply_markup=_build_subscription_keyboard(message.from_user.id),
+        )
+        return
+    await _open_search_settings(message, state, (message.text or "").strip())
+
+
+@dp.message(StateFilter(None), F.text & ~F.text.startswith("/"))
+async def handle_text(message: Message, state: FSMContext) -> None:
+    _sync_user(message.from_user)
+    if not _has_access(message.from_user.id):
+        await message.answer(
+            _subscription_required_text(),
+            parse_mode="HTML",
+            reply_markup=_build_subscription_keyboard(message.from_user.id),
+        )
+        return
+    await _open_search_settings(message, state, (message.text or "").strip())
+
+
+@dp.callback_query(F.data.startswith("cfg:"))
+async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+
+    _sync_user(callback.from_user)
+    current_state = await state.get_state()
+    if current_state != SearchState.configuring_search.state:
+        await callback.answer("Настройки устарели. Отправьте запрос заново.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    query = data.get("query", "")
+    if not query:
+        await state.clear()
+        await callback.answer("Запрос не найден. Отправьте его заново.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    action = parts[1]
+
+    if action == "cancel":
+        await state.clear()
+        await _show_panel(
+            callback.message,
+            _home_text(callback.from_user.id),
+            _build_home_keyboard(callback.from_user.id),
+        )
+        await callback.answer("Поиск отменен")
+        return
+
+    if action == "start":
+        if not _has_access(callback.from_user.id):
+            await state.clear()
+            await _show_panel(
+                callback.message,
+                _subscription_required_text(),
+                _build_subscription_keyboard(callback.from_user.id),
+            )
+            await callback.answer("Нужна активная подписка", show_alert=True)
+            return
+
+        settings = _extract_settings(data)
+        logger.info(
+            "[UI] Search started | chat=%s | user=%s | query=%r | settings=%s",
+            callback.message.chat.id,
+            callback.from_user.id,
+            query,
+            settings,
+        )
+        await state.clear()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.answer("Запускаю парсинг...")
+        await run_search(callback.message, callback.from_user.id, query, settings)
+        return
+
+    if action == "check" and len(parts) == 3:
+        await state.update_data(max_check=int(parts[2]))
+    elif action == "pages" and len(parts) == 3:
+        await state.update_data(max_pages=int(parts[2]))
+    elif action == "reviews" and len(parts) == 3:
+        await state.update_data(review_filter=parts[2])
+    elif action == "category" and len(parts) == 3 and parts[2] in CATEGORY_OPTIONS:
+        await state.update_data(category_key=parts[2])
+    else:
+        await callback.answer()
+        return
+
+    updated_data = await state.get_data()
+    settings = _extract_settings(updated_data)
+    logger.info(
+        "[UI] Settings updated | chat=%s | user=%s | query=%r | settings=%s",
+        callback.message.chat.id,
+        callback.from_user.id,
+        query,
+        settings,
+    )
+
+    await _show_panel(
+        callback.message,
+        _build_settings_text(query, settings),
+        _build_settings_keyboard(settings),
+    )
+    await callback.answer("Настройки обновлены")
+
+
+async def _open_search_settings(message: Message, state: FSMContext, query: str) -> None:
+    if len(query) < 2:
+        await message.answer("❗ Запрос слишком короткий. Введите минимум 2 символа.")
+        return
+
+    existing = await state.get_data()
+    old_message_id = existing.get("settings_message_id")
+    if old_message_id:
+        try:
+            await bot.delete_message(message.chat.id, old_message_id)
+        except Exception:
+            pass
+
+    settings = {
+        "category_key": existing.get("category_key", "all"),
+        "max_check": existing.get("max_check", config.MAX_LISTINGS_CHECK),
+        "max_pages": existing.get("max_pages", config.MAX_PAGES),
+        "review_filter": existing.get("review_filter", "any"),
+    }
+
+    await state.set_state(SearchState.configuring_search)
+    await state.update_data(query=query, **settings)
+
+    sent = await message.answer(
+        _build_settings_text(query, settings),
+        parse_mode="HTML",
+        reply_markup=_build_settings_keyboard(settings),
+    )
+    await state.update_data(settings_message_id=sent.message_id)
+
+    logger.info(
+        "[UI] Settings opened | chat=%s | user=%s | query=%r | settings=%s",
+        message.chat.id,
+        message.from_user.id if message.from_user else "unknown",
+        query,
+        settings,
+    )
+
+
+async def run_search(message: Message, requester_id: int, query: str, settings: dict) -> None:
+    db.record_search(requester_id, query)
+
     status_msg = await message.answer(
         _build_status_text(query, settings),
         parse_mode="HTML",
@@ -432,7 +845,7 @@ async def run_search(message: Message, query: str, settings: dict) -> None:
             progress_state["last_text"] = text
             progress_state["last_update"] = now
         except Exception:
-            logger.exception("Не удалось обновить статус поиска")
+            logger.exception("Failed to update search status")
 
     try:
         await bot.send_chat_action(message.chat.id, "typing")
@@ -446,17 +859,19 @@ async def run_search(message: Message, query: str, settings: dict) -> None:
             progress_callback=on_progress,
         )
 
-        await _show_search_result(message, status_msg, query, settings, result)
+        await _show_search_result(message, requester_id, status_msg, query, settings, result)
     except Exception:
-        logger.exception("Ошибка при поиске '%s'", query)
+        logger.exception("Search failed | query=%s | user=%s", query, requester_id)
         try:
             await status_msg.edit_text("⚠️ Произошла ошибка. Попробуйте позже.")
         except Exception:
             pass
+        await _send_home(message, requester_id)
 
 
 async def _show_search_result(
     message: Message,
+    requester_id: int,
     status_msg: Message,
     query: str,
     settings: dict,
@@ -476,6 +891,7 @@ async def _show_search_result(
             f"Фильтр по отзывам: {hbold(REVIEW_FILTER_LABELS[settings['review_filter']])}",
             parse_mode="HTML",
         )
+        await _send_home(message, requester_id)
         return
 
     total = len(listings)
@@ -485,7 +901,7 @@ async def _show_search_result(
         parse_mode="HTML",
     )
     await message.answer(
-        f"✅ Найдено {hbold(str(total))} объявл. "
+        f"✅ Найдено {hbold(str(total))} объявлений. "
         f"(показываю {shown} из {stats.listings_checked} проверенных).",
         parse_mode="HTML",
     )
@@ -505,23 +921,17 @@ async def _show_search_result(
             try:
                 await bot.send_media_group(message.chat.id, media=media_group)
             except Exception:
-                await message.answer(
-                    caption,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
+                await message.answer(caption, parse_mode="HTML", disable_web_page_preview=True)
         else:
-            await message.answer(
-                caption,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
+            await message.answer(caption, parse_mode="HTML", disable_web_page_preview=True)
         await asyncio.sleep(0.5)
+
+    await _send_home(message, requester_id)
 
 
 def _build_status_text(query: str, settings: dict, progress: dict | None = None) -> str:
     lines = [
-        f"🔍 Ищу: {hbold(query)}",
+        f"🔌 Ищу: {hbold(query)}",
         (
             f"⚙️ До {settings['max_check']} объявлений, "
             f"{settings['max_pages']} стр., "
@@ -531,23 +941,18 @@ def _build_status_text(query: str, settings: dict, progress: dict | None = None)
     ]
 
     if not progress:
-        lines.append("⏳ Готовлюсь к парсингу…")
+        lines.append("⏳ Готовлюсь к парсингу...")
         return "\n".join(lines)
 
     if progress["phase"] == "collect":
-        lines.append(
-            f"📄 Собираю объявления: страница {progress['page']}/{settings['max_pages']}"
-        )
+        lines.append(f"📄 Собираю объявления: страница {progress['page']}/{settings['max_pages']}")
         lines.append(f"📦 Уникальных объявлений: {progress['collected']}")
     elif progress["phase"] == "check":
-        lines.append(
-            f"🧪 Проверяю продавцов: {progress['checked']}/{progress['total']}"
-        )
+        lines.append(f"🧪 Проверяю продавцов: {progress['checked']}/{progress['total']}")
         lines.append(f"🟢 Подошло сейчас: {progress['matched']}")
         current_title = progress.get("current_title")
         if current_title:
-            title = escape(current_title[:60])
-            lines.append(f"📌 Сейчас: <code>{title}</code>")
+            lines.append(f"📌 Сейчас: <code>{escape(current_title[:60])}</code>")
     elif progress["phase"] == "done":
         lines.append(f"✅ Проверка завершена. Найдено: {progress['matched']}")
 
@@ -582,13 +987,13 @@ def _format_listing(idx: int, listing: dict) -> str:
 
     reviews_count = listing.get("reviews_count")
     if reviews_count is None:
-        lines.append("⭐ Отзывы: нет")
+        lines.append("⭐ Отзывы: не удалось определить точно")
     else:
         lines.append(f"⭐ Отзывы: {_escape_html(reviews_count)}")
 
     desc = listing.get("description", "").strip()
     if desc:
-        short = desc[:300] + ("…" if len(desc) > 300 else "")
+        short = desc[:300] + ("..." if len(desc) > 300 else "")
         lines.append(f"\n📝 {_escape_html(short)}")
 
     url = listing.get("url", "")
@@ -605,12 +1010,13 @@ def _escape_html(value: object) -> str:
 
 async def on_shutdown(dispatcher: Dispatcher) -> None:
     await parser.close()
-    logger.info("HTTP-сессия парсера закрыта")
+    db.close()
+    logger.info("Shutdown completed")
 
 
 async def main() -> None:
     dp.shutdown.register(on_shutdown)
-    logger.info("Бот запущен")
+    logger.info("Bot started")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 

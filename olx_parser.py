@@ -10,6 +10,7 @@ import random
 import re
 import socket
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import quote
@@ -127,6 +128,12 @@ class OLXParser:
             "Sec-Fetch-Site": "none",
             "Cache-Control": "max-age=0",
         }
+
+    @staticmethod
+    def _normalize_match_text(text: str) -> str:
+        normalized = unicodedata.normalize("NFKD", text)
+        ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+        return re.sub(r"\s+", " ", ascii_text).strip().lower()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -435,7 +442,7 @@ class OLXParser:
         if count is not None:
             return count
 
-        full_text = soup.get_text(" ", strip=True)
+        full_text = self._normalize_match_text(soup.get_text(" ", strip=True))
         match = _REVIEWS_RE.search(full_text)
         if match:
             return int(match.group(1))
@@ -524,11 +531,10 @@ class OLXParser:
 
     @staticmethod
     def _matches_review_filter(reviews_count: Optional[int], review_filter: str) -> bool:
-        has_reviews = reviews_count is not None and reviews_count > 0
         if review_filter == "with":
-            return has_reviews
+            return reviews_count is not None and reviews_count > 0
         if review_filter == "without":
-            return not has_reviews
+            return reviews_count == 0
         return True
 
     async def _notify_progress(
