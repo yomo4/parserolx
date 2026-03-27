@@ -40,3 +40,6 @@ DB_PATH: str = os.getenv("DB_PATH", "data/bot.sqlite3")
 
 # Файл или папка с cookies OLX
 COOKIE_SOURCE: str = os.getenv("COOKIE_SOURCE", "cookie olx")
+
+# Через сколько часов забывать уже показанные ссылки
+SEEN_LINK_TTL_HOURS: int = int(os.getenv("SEEN_LINK_TTL_HOURS", "72"))

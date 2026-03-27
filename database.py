@@ -73,6 +73,19 @@ class BotDatabase:
                 delivered_count INTEGER NOT NULL DEFAULT 0,
                 failed_count INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS seen_listings (
+                user_id INTEGER NOT NULL,
+                search_key TEXT NOT NULL,
+                url TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, search_key, url),
+                FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_seen_listings_last_seen_at
+            ON seen_listings(last_seen_at);
             """
         )
         self._conn.commit()
@@ -145,6 +158,69 @@ class BotDatabase:
                 (query, dt_to_iso(utc_now()), user_id),
             )
             self._conn.commit()
+
+    def filter_new_listings(
+        self,
+        user_id: int,
+        search_key: str,
+        listings: list[dict],
+        ttl_hours: int,
+    ) -> tuple[list[dict], int]:
+        now = utc_now()
+        cutoff = now - timedelta(hours=max(ttl_hours, 0))
+        now_iso = dt_to_iso(now)
+        cutoff_iso = dt_to_iso(cutoff)
+
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM seen_listings WHERE last_seen_at < ?",
+                (cutoff_iso,),
+            )
+
+            rows = self._conn.execute(
+                """
+                SELECT url
+                FROM seen_listings
+                WHERE user_id = ? AND search_key = ?
+                """,
+                (user_id, search_key),
+            ).fetchall()
+            seen_urls = {str(row["url"]) for row in rows}
+
+            fresh_listings: list[dict] = []
+            skipped_old = 0
+            new_rows: list[tuple[int, str, str, str, str]] = []
+
+            for listing in listings:
+                url = str(listing.get("url") or "").strip()
+                if not url:
+                    fresh_listings.append(listing)
+                    continue
+                if url in seen_urls:
+                    skipped_old += 1
+                    continue
+                fresh_listings.append(listing)
+                new_rows.append((user_id, search_key, url, now_iso, now_iso))
+
+            if new_rows:
+                self._conn.executemany(
+                    """
+                    INSERT INTO seen_listings (
+                        user_id,
+                        search_key,
+                        url,
+                        first_seen_at,
+                        last_seen_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id, search_key, url) DO UPDATE SET
+                        last_seen_at = excluded.last_seen_at
+                    """,
+                    new_rows,
+                )
+
+            self._conn.commit()
+
+        return fresh_listings, skipped_old
 
     def generate_subscription_code(self, duration_days: int, created_by: int) -> str:
         alphabet = string.ascii_uppercase + string.digits

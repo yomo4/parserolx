@@ -292,6 +292,18 @@ def _normalize_query_for_search(query: str, settings: dict) -> str:
     return "" if settings.get("search_mode") == "category_only" else query.strip()
 
 
+def _build_search_key(query: str, settings: dict) -> str:
+    normalized_query = _normalize_query_for_search(query, settings).casefold()
+    return "|".join(
+        (
+            f"mode={settings['search_mode']}",
+            f"category={settings['category_key']}",
+            f"reviews={settings['review_filter']}",
+            f"query={normalized_query}",
+        )
+    )
+
+
 def _extract_settings(data: dict) -> dict:
     category_key = str(data.get("category_key", "all"))
     if category_key not in CATEGORY_OPTIONS:
@@ -953,6 +965,7 @@ async def _open_search_settings(
 
 async def run_search(message: Message, requester_id: int, query: str, settings: dict) -> None:
     db.record_search(requester_id, _search_target_text(query, settings))
+    search_key = _build_search_key(query, settings)
 
     status_msg = await message.answer(
         _build_status_text(query, settings),
@@ -995,6 +1008,25 @@ async def run_search(message: Message, requester_id: int, query: str, settings: 
             progress_callback=on_progress,
         )
 
+        fresh_listings, skipped_seen = db.filter_new_listings(
+            requester_id,
+            search_key,
+            result.listings,
+            config.SEEN_LINK_TTL_HOURS,
+        )
+        result.stats.already_seen_skipped = skipped_seen
+        result.stats.listings_matched = len(fresh_listings)
+        logger.info(
+            "[DEDUPE] user=%s key=%r matched=%d new=%d skipped_seen=%d ttl_hours=%d",
+            requester_id,
+            search_key,
+            len(result.listings),
+            len(fresh_listings),
+            skipped_seen,
+            config.SEEN_LINK_TTL_HOURS,
+        )
+        result = SearchResult(listings=fresh_listings, stats=result.stats)
+
         await _show_search_result(message, requester_id, status_msg, query, settings, result)
     except Exception:
         logger.exception("Search failed | query=%s | user=%s", query, requester_id)
@@ -1015,18 +1047,28 @@ async def _show_search_result(
 ) -> None:
     listings = result.listings
     stats = result.stats
+    skipped_seen = getattr(stats, "already_seen_skipped", 0)
 
     if not listings:
         await status_msg.edit_text(
             _build_completion_text(query, settings, stats, found=0),
             parse_mode="HTML",
         )
-        await message.answer(
-            f"😔 Для {hbold(_search_target_text(query, settings))} ничего не найдено.\n"
-            f"Категория: {hbold(CATEGORY_OPTIONS[settings['category_key']]['label'])}\n"
-            f"Фильтр по отзывам: {hbold(REVIEW_FILTER_LABELS[settings['review_filter']])}",
-            parse_mode="HTML",
-        )
+        if skipped_seen:
+            await message.answer(
+                f"♻️ Для {hbold(_search_target_text(query, settings))} новых объявлений пока нет.\n"
+                f"Старых уже показанных пропущено: {hbold(str(skipped_seen))}\n"
+                f"Память по ссылкам: {hbold(str(config.SEEN_LINK_TTL_HOURS))} ч.\n"
+                f"Фильтр по отзывам: {hbold(REVIEW_FILTER_LABELS[settings['review_filter']])}",
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer(
+                f"😔 Для {hbold(_search_target_text(query, settings))} ничего не найдено.\n"
+                f"Категория: {hbold(CATEGORY_OPTIONS[settings['category_key']]['label'])}\n"
+                f"Фильтр по отзывам: {hbold(REVIEW_FILTER_LABELS[settings['review_filter']])}",
+                parse_mode="HTML",
+            )
         await _send_home(message, requester_id)
         return
 
@@ -1037,8 +1079,13 @@ async def _show_search_result(
         parse_mode="HTML",
     )
     await message.answer(
-        f"✅ Найдено {hbold(str(total))} объявлений. "
-        f"(показываю {shown} из {stats.listings_checked} проверенных).",
+        f"✅ Найдено {hbold(str(total))} новых объявлений. "
+        f"(показываю {shown} из {stats.listings_checked} проверенных)."
+        + (
+            f"\n♻️ Уже показывалось раньше и пропущено: {hbold(str(skipped_seen))}"
+            if skipped_seen
+            else ""
+        ),
         parse_mode="HTML",
     )
 
@@ -1109,6 +1156,9 @@ def _build_completion_text(query: str, settings: dict, stats, found: int) -> str
         f"🟢 Найдено онлайн: {found}",
         f"⏱ Время: {stats.elapsed:.1f} сек.",
     ]
+    if getattr(stats, "already_seen_skipped", 0):
+        lines.append(f"♻️ Уже показывались раньше: {stats.already_seen_skipped}")
+        lines.append(f"🧠 Память ссылок: {config.SEEN_LINK_TTL_HOURS} ч.")
     return "\n".join(lines)
 
 
@@ -1138,7 +1188,12 @@ def _format_listing(idx: int, listing: dict) -> str:
 
     reviews_count = listing.get("reviews_count")
     if reviews_count is None:
-        lines.append("⭐ Отзывы: не удалось определить точно")
+        if listing.get("seller_rating"):
+            lines.append("⭐ Отзывы: есть рейтинг, но OLX не отдал точное число")
+        elif listing.get("has_review_signal"):
+            lines.append("⭐ Отзывы: есть сигнал отзывов, точное число не определено")
+        else:
+            lines.append("⭐ Отзывы: без подтвержденных отзывов")
     else:
         lines.append(f"⭐ Отзывы: {_escape_html(reviews_count)}")
 
