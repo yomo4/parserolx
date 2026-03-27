@@ -429,6 +429,7 @@ class OLXParser:
                 "reviews_count": None,
                 "reviews_source": "empty",
                 "has_review_signal": False,
+                "has_no_reviews_signal": False,
                 "seller_name": None,
                 "seller_type": None,
                 "seller_rating": None,
@@ -441,11 +442,14 @@ class OLXParser:
         seller_name = self._parse_seller_name(soup)
         seller_type = self._parse_seller_type(soup)
         seller_rating = self._parse_seller_rating_value(soup)
-        reviews_count, reviews_source, has_review_signal = self._parse_reviews_info(soup, seller_rating)
+        reviews_count, reviews_source, has_review_signal, has_no_reviews_signal = self._parse_reviews_info(
+            soup,
+            seller_rating,
+        )
         seller_debug = self._collect_seller_debug(soup)
 
         logger.debug(
-            "[DETAIL] seller=%r type=%r rating=%r status=%r reviews=%r source=%s signal=%s desc=%d images=%d url=%s",
+            "[DETAIL] seller=%r type=%r rating=%r status=%r reviews=%r source=%s signal=%s no_reviews=%s desc=%d images=%d url=%s",
             seller_name,
             seller_type,
             seller_rating,
@@ -453,18 +457,20 @@ class OLXParser:
             reviews_count,
             reviews_source,
             "yes" if has_review_signal else "no",
+            "yes" if has_no_reviews_signal else "no",
             len(description),
             len(images),
             url,
         )
         logger.info(
-            "[SELLER] type=%r name=%r rating=%r reviews=%r reviews_source=%s review_signal=%s status=%r debug=%s",
+            "[SELLER] type=%r name=%r rating=%r reviews=%r reviews_source=%s review_signal=%s no_reviews=%s status=%r debug=%s",
             seller_type,
             seller_name,
             seller_rating,
             reviews_count,
             reviews_source,
             "yes" if has_review_signal else "no",
+            "yes" if has_no_reviews_signal else "no",
             status,
             seller_debug,
         )
@@ -475,6 +481,7 @@ class OLXParser:
             "reviews_count": reviews_count,
             "reviews_source": reviews_source,
             "has_review_signal": has_review_signal,
+            "has_no_reviews_signal": has_no_reviews_signal,
             "seller_name": seller_name,
             "seller_type": seller_type,
             "seller_rating": seller_rating,
@@ -715,35 +722,39 @@ class OLXParser:
         self,
         soup: BeautifulSoup,
         seller_rating: Optional[str],
-    ) -> tuple[Optional[int], str, bool]:
+    ) -> tuple[Optional[int], str, bool, bool]:
         count = self._extract_reviews_count_nextdata(soup)
         if count is not None:
-            return count, "nextdata", count > 0
+            return count, "nextdata", count > 0, count == 0
 
         count = self._extract_reviews_count_from_review_nodes(soup)
         if count is not None:
-            return count, "review_nodes", count > 0
+            return count, "review_nodes", count > 0, count == 0
 
         count = self._extract_reviews_count_from_texts(self._collect_seller_texts(soup))
         if count is not None:
-            return count, "seller_text", count > 0
+            return count, "seller_text", count > 0, count == 0
 
         count = self._extract_reviews_count_from_scripts(soup)
         if count is not None:
-            return count, "scripts", count > 0
+            return count, "scripts", count > 0, count == 0
 
         full_text = self._normalize_match_text(soup.get_text(" ", strip=True))
         match = _REVIEWS_RE.search(full_text)
         if match:
             count = int(match.group(1))
-            return count, "page_text", count > 0
+            return count, "page_text", count > 0, count == 0
 
         if _NO_REVIEWS_RE.search(full_text):
-            return 0, "page_text_zero", False
+            return 0, "page_text_zero", False, True
+
+        seller_texts = self._collect_seller_texts(soup)
+        if self._has_generic_reviews_signal(seller_texts):
+            return None, "seller_text_signal", True, False
 
         if seller_rating:
-            return None, "rating_fallback", True
-        return None, "unknown", False
+            return None, "rating_fallback", True, False
+        return None, "unknown", False, False
 
     def _extract_reviews_count_from_texts(self, texts: list[str]) -> Optional[int]:
         for text in texts:
@@ -754,6 +765,18 @@ class OLXParser:
             if _NO_REVIEWS_RE.search(normalized):
                 return 0
         return None
+
+    def _has_generic_reviews_signal(self, texts: list[str]) -> bool:
+        for text in texts:
+            normalized = self._normalize_match_text(text)
+            if _NO_REVIEWS_RE.search(normalized):
+                continue
+            if any(
+                token in normalized
+                for token in ("ratinguri", "review", "reviews", "recenzii", "evaluari", "opinii")
+            ):
+                return True
+        return False
 
     def _extract_reviews_count_nextdata(self, soup: BeautifulSoup) -> Optional[int]:
         data = self._get_nextdata(soup)
@@ -875,12 +898,13 @@ class OLXParser:
         reviews_count: Optional[int],
         review_filter: str,
         seller_rating: Optional[str] = None,
+        has_no_reviews_signal: bool = False,
     ) -> bool:
         has_reviews = (reviews_count is not None and reviews_count > 0) or bool((seller_rating or "").strip())
         if review_filter == "with":
             return has_reviews
         if review_filter == "without":
-            return not has_reviews and (reviews_count is None or reviews_count == 0)
+            return has_no_reviews_signal and not has_reviews
         return True
 
     @staticmethod
@@ -1008,6 +1032,7 @@ class OLXParser:
                 reviews_count,
                 review_filter,
                 details.get("seller_rating"),
+                bool(details.get("has_no_reviews_signal")),
             )
             decision = "pass" if online and review_match else "filtered"
             if not online:
@@ -1018,7 +1043,7 @@ class OLXParser:
                 decision = "filtered_reviews"
 
             logger.info(
-                "[CHECK] %d/%d online=%s seller_type=%r seller_match=%s seller=%r rating=%r reviews=%r source=%s signal=%s filter=%s review_match=%s decision=%s requests=%d",
+                "[CHECK] %d/%d online=%s seller_type=%r seller_match=%s seller=%r rating=%r reviews=%r source=%s signal=%s no_reviews=%s filter=%s review_match=%s decision=%s requests=%d",
                 idx,
                 total,
                 "yes" if online else "no",
@@ -1029,6 +1054,7 @@ class OLXParser:
                 reviews_count,
                 details.get("reviews_source"),
                 "yes" if details.get("has_review_signal") else "no",
+                "yes" if details.get("has_no_reviews_signal") else "no",
                 review_filter,
                 "yes" if review_match else "no",
                 decision,
@@ -1042,6 +1068,7 @@ class OLXParser:
                 listing["reviews_count"] = reviews_count
                 listing["reviews_source"] = details.get("reviews_source")
                 listing["has_review_signal"] = details.get("has_review_signal")
+                listing["has_no_reviews_signal"] = details.get("has_no_reviews_signal")
                 listing["seller_name"] = details.get("seller_name")
                 listing["seller_type"] = details.get("seller_type")
                 listing["seller_rating"] = details.get("seller_rating")
