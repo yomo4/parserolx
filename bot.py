@@ -136,7 +136,15 @@ def _access_status_text(user_id: int) -> str:
 
 def _build_block(title: str, lines: list[str], expandable: bool = False) -> str:
     tag = "blockquote expandable" if expandable else "blockquote"
-    content = "\n".join(line for line in lines if line)
+    normalized: list[str] = []
+    for line in lines:
+        if not line:
+            continue
+        if isinstance(line, (list, tuple)):
+            normalized.extend(str(item) for item in line if item)
+        else:
+            normalized.append(str(line))
+    content = "\n".join(normalized)
     return f"<{tag}><b>{escape(title)}</b>\n{content}</{tag.split()[0]}>"
 
 
@@ -1289,11 +1297,9 @@ async def _show_search_result(
                     [
                         f"Найдено новых: <b>{total}</b>",
                         f"Показываю сейчас: <b>{shown}</b> из <b>{stats.listings_checked}</b> проверенных",
-                        (
-                            f"Уже показывалось раньше: <b>{skipped_seen}</b>"
-                            if skipped_seen
-                            else "Дубликаты по памяти ссылок не обнаружены",
-                        ),
+                        f"Уже показывалось раньше: <b>{skipped_seen}</b>"
+                        if skipped_seen
+                        else "Дубликаты по памяти ссылок не обнаружены",
                     ],
                 ),
             ]
