@@ -1192,18 +1192,17 @@ def _build_final_summary_text(
         lines.append(f"Уже показанных ранее пропущено: <b>{stats.already_seen_skipped}</b>")
 
     lines.append("")
-    lines.append(f"<b>Ссылки на объявления:</b> <i>первые {shown} из {total_found}</i>")
+    lines.append(f"<b>Прямые ссылки:</b> <i>первые {shown} из {total_found}</i>")
     if not summary_list:
         lines.append("Нет новых ссылок.")
     else:
         for idx, listing in enumerate(summary_list, start=1):
-            title = escape((listing.get("title") or "Объявление")[:70])
             url = str(listing.get("url") or "").strip()
             if url:
                 safe_url = escape(url, quote=True)
-                lines.append(f"{idx}. <a href='{safe_url}'>{title}</a>")
+                lines.append(f"{idx}. <a href='{safe_url}'>{safe_url}</a>")
             else:
-                lines.append(f"{idx}. {title}")
+                lines.append(f"{idx}. ссылка не найдена")
 
     return "\n".join(lines)
 
