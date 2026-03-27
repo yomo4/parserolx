@@ -1,7 +1,6 @@
 """
-OLX.ro async parser.
-Ищет объявления по запросу и фильтрует по онлайн-статусу продавца
-и наличию отзывов.
+Async OLX.ro parser with category-aware search, online-status filtering,
+review filtering, progress callbacks, and request statistics.
 """
 
 import asyncio
@@ -12,7 +11,7 @@ import re
 import socket
 import time
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import quote
 
 import aiohttp
@@ -47,12 +46,12 @@ _ONLINE_EXTRACT_RE = re.compile(
 )
 
 _REVIEWS_RE = re.compile(
-    r"(\d+)\s*(?:review(?:-uri)?|reviews|recenzii|evaluari|evaluări|opinii)",
+    r"(\d+)\s*(?:review(?:-uri)?|reviews|recenzii|evaluari|evalu\u0103ri|opinii)",
     re.IGNORECASE,
 )
 
 _NO_REVIEWS_RE = re.compile(
-    r"(?:fara\s+evaluari|fără\s+evaluări|0\s+(?:review(?:-uri)?|reviews|recenzii|evaluari|evaluări|opinii))",
+    r"(?:fara\s+evaluari|f\u0103r\u0103\s+evalu\u0103ri|0\s+(?:review(?:-uri)?|reviews|recenzii|evaluari|evalu\u0103ri|opinii))",
     re.IGNORECASE,
 )
 
@@ -72,6 +71,7 @@ class SearchStats:
     max_pages: int
     max_check: int
     review_filter: str
+    category_path: str = ""
     requests_made: int = 0
     pages_loaded: int = 0
     listings_seen: int = 0
@@ -101,6 +101,17 @@ class OLXParser:
     def _build_search_slug(query: str) -> str:
         normalized = re.sub(r"\s+", "-", query.strip())
         return quote(normalized, safe="")
+
+    def _build_search_url(self, query: str, page: int, category_path: str = "") -> str:
+        slug = self._build_search_slug(query)
+        normalized_path = category_path.strip("/")
+        if normalized_path:
+            url = f"{self.BASE_URL}/{normalized_path}/q-{slug}/"
+        else:
+            url = self.SEARCH_URL.format(query=slug)
+        if page > 1:
+            url += f"?page={page}"
+        return url
 
     def _build_headers(self) -> dict:
         return {
@@ -141,44 +152,48 @@ class OLXParser:
                 allow_redirects=True,
                 verify=False,
             )
-            if response.status_code == 200:
-                text = response.text
-                logger.debug(
-                    "CURL OK %d | %d bytes | %s",
-                    response.status_code,
-                    len(text),
-                    url,
-                )
-                return text
-            logger.warning("CURL HTTP %d | %s", response.status_code, url)
         except Exception as exc:
-            logger.error("CURL ERROR | %r | %s", exc, url)
+            logger.error("CURL error | %r | %s", exc, url)
+            return None
+
+        if response.status_code == 200:
+            text = response.text
+            logger.debug("CURL ok | bytes=%d | %s", len(text), url)
+            return text
+
+        logger.warning("CURL http=%d | %s", response.status_code, url)
         return None
 
     async def _fetch(self, url: str, stats: SearchStats) -> Optional[str]:
         session = await self._get_session()
         stats.requests_made += 1
-        t0 = time.monotonic()
+        started = time.monotonic()
         logger.debug("GET %s", url)
+
         try:
-            async with session.get(url, headers=self._build_headers()) as resp:
-                elapsed = time.monotonic() - t0
-                if resp.status == 200:
-                    text = await resp.text()
+            async with session.get(url, headers=self._build_headers()) as response:
+                elapsed = time.monotonic() - started
+                if response.status == 200:
+                    text = await response.text()
                     logger.debug(
-                        "OK %d | %.2fs | %d bytes | %s",
-                        resp.status,
+                        "HTTP ok | status=%d | elapsed=%.2fs | bytes=%d | %s",
+                        response.status,
                         elapsed,
                         len(text),
                         url,
                     )
                     return text
-                logger.warning("HTTP %d | %.2fs | %s", resp.status, elapsed, url)
+                logger.warning(
+                    "HTTP bad status=%d | elapsed=%.2fs | %s",
+                    response.status,
+                    elapsed,
+                    url,
+                )
                 return None
         except asyncio.TimeoutError:
-            logger.error("TIMEOUT (%.2fs) | %s", time.monotonic() - t0, url)
+            logger.error("HTTP timeout | elapsed=%.2fs | %s", time.monotonic() - started, url)
         except aiohttp.ClientError as exc:
-            logger.warning("AIOHTTP ERROR | %r | %s", exc, url)
+            logger.warning("AIOHTTP error | %r | %s", exc, url)
             text = await asyncio.to_thread(self._fetch_with_curl, url, stats)
             if text:
                 return text
@@ -189,20 +204,19 @@ class OLXParser:
         query: str,
         page: int,
         stats: SearchStats,
+        category_path: str = "",
     ) -> list[dict]:
-        slug = self._build_search_slug(query)
-        url = self.SEARCH_URL.format(query=slug)
-        if page > 1:
-            url += f"?page={page}"
+        url = self._build_search_url(query, page, category_path)
+        logger.info("[SEARCH] Page %d url=%s", page, url)
 
-        logger.info("[SEARCH] Запрос стр.%d -> %s", page, url)
         html = await self._fetch(url, stats)
         if not html:
-            logger.warning("[SEARCH] Стр.%d — пустой ответ", page)
+            logger.warning("[SEARCH] Page %d returned empty body", page)
             return []
+
         stats.pages_loaded += 1
         cards = self._parse_listing_cards(html)
-        logger.info("[SEARCH] Стр.%d — найдено карточек: %d", page, len(cards))
+        logger.info("[SEARCH] Page %d cards=%d", page, len(cards))
         return cards
 
     def _parse_listing_cards(self, html: str) -> list[dict]:
@@ -210,12 +224,11 @@ class OLXParser:
 
         items = self._parse_nextdata_listings(soup)
         if items:
-            logger.debug("[PARSE] Источник: __NEXT_DATA__ (%d карточек)", len(items))
+            logger.debug("[PARSE] Source=__NEXT_DATA__ cards=%d", len(items))
             return items
 
-        logger.debug("[PARSE] __NEXT_DATA__ не найден — переходим на HTML-парсинг")
         items = self._parse_html_cards(soup)
-        logger.debug("[PARSE] Источник: HTML (%d карточек)", len(items))
+        logger.debug("[PARSE] Source=HTML cards=%d", len(items))
         return items
 
     def _get_nextdata(self, soup: BeautifulSoup) -> Optional[dict]:
@@ -230,54 +243,50 @@ class OLXParser:
     def _parse_nextdata_listings(self, soup: BeautifulSoup) -> list[dict]:
         data = self._get_nextdata(soup)
         if not data:
-            logger.debug("[NEXT_DATA] Тег __NEXT_DATA__ не найден")
             return []
 
-        results = []
+        results: list[dict] = []
         try:
             page_props = data["props"]["pageProps"]
             ads = page_props.get("ads") or page_props.get("data", {}).get("ads") or []
-            logger.debug("[NEXT_DATA] Объявлений в JSON: %d", len(ads))
-            for ad in ads:
-                url = ad.get("url", "")
-                if url and not url.startswith("http"):
-                    url = self.BASE_URL + url
-
-                price_raw = ad.get("price", {})
-                price = (
-                    price_raw.get("displayValue", "")
-                    if isinstance(price_raw, dict)
-                    else str(price_raw)
-                )
-
-                loc_raw = ad.get("location", {})
-                location = (
-                    loc_raw.get("name", "")
-                    if isinstance(loc_raw, dict)
-                    else str(loc_raw)
-                )
-
-                results.append(
-                    {
-                        "title": ad.get("title", ""),
-                        "price": price,
-                        "location": location,
-                        "url": url,
-                        "last_online": None,
-                    }
-                )
         except (KeyError, TypeError) as exc:
-            logger.warning("[NEXT_DATA] Ошибка разбора ads: %s", exc)
+            logger.warning("[NEXT_DATA] Ads parse error: %s", exc)
+            return []
+
+        for ad in ads:
+            url = ad.get("url", "")
+            if url and not url.startswith("http"):
+                url = self.BASE_URL + url
+
+            price_raw = ad.get("price", {})
+            if isinstance(price_raw, dict):
+                price = price_raw.get("displayValue", "")
+            else:
+                price = str(price_raw)
+
+            location_raw = ad.get("location", {})
+            if isinstance(location_raw, dict):
+                location = location_raw.get("name", "")
+            else:
+                location = str(location_raw)
+
+            results.append(
+                {
+                    "title": ad.get("title", ""),
+                    "price": price,
+                    "location": location,
+                    "url": url,
+                    "last_online": None,
+                }
+            )
+
         return results
 
     def _parse_html_cards(self, soup: BeautifulSoup) -> list[dict]:
-        results = []
+        results: list[dict] = []
         cards = soup.find_all("div", {"data-cy": "l-card"})
         if not cards:
             cards = soup.find_all("div", attrs={"data-testid": "listing-grid-item"})
-
-        if not cards:
-            logger.warning("[HTML] Карточки не найдены ни одним селектором")
 
         for card in cards:
             item = self._extract_card(card)
@@ -285,7 +294,7 @@ class OLXParser:
                 results.append(item)
         return results
 
-    def _extract_card(self, card) -> Optional[dict]:
+    def _extract_card(self, card: Any) -> Optional[dict]:
         try:
             link = card.find("a", href=True)
             if not link:
@@ -303,8 +312,8 @@ class OLXParser:
             price_el = card.find(attrs={"data-testid": "ad-price"})
             price = price_el.get_text(strip=True) if price_el else ""
 
-            loc_el = card.find(attrs={"data-testid": "location-date"})
-            location = loc_el.get_text(strip=True) if loc_el else ""
+            location_el = card.find(attrs={"data-testid": "location-date"})
+            location = location_el.get_text(strip=True) if location_el else ""
 
             return {
                 "title": title,
@@ -318,10 +327,10 @@ class OLXParser:
             return None
 
     async def _fetch_listing_details(self, url: str, stats: SearchStats) -> dict:
-        logger.debug("[DETAIL] Загрузка объявления: %s", url)
+        logger.debug("[DETAIL] Loading %s", url)
         html = await self._fetch(url, stats)
         if not html:
-            logger.warning("[DETAIL] Не удалось загрузить: %s", url)
+            logger.warning("[DETAIL] Empty response for %s", url)
             return {
                 "last_online": None,
                 "description": "",
@@ -336,7 +345,7 @@ class OLXParser:
         reviews_count = self._parse_reviews_count(soup)
 
         logger.debug(
-            "[DETAIL] Статус: %r | Отзывы: %r | Описание: %d | Фото: %d | %s",
+            "[DETAIL] status=%r reviews=%r desc=%d images=%d url=%s",
             status,
             reviews_count,
             len(description),
@@ -353,24 +362,19 @@ class OLXParser:
     def _parse_seller_status_from_soup(self, soup: BeautifulSoup) -> Optional[str]:
         status = self._extract_status_nextdata(soup)
         if status:
-            logger.debug("[STATUS] Источник: NEXT_DATA -> %r", status)
             return status
 
-        for attr_val in ("seller-activity", "user-activity", "last-seen"):
-            el = soup.find(attrs={"data-testid": attr_val})
-            if el:
-                text = el.get_text(strip=True)
+        for test_id in ("seller-activity", "user-activity", "last-seen"):
+            element = soup.find(attrs={"data-testid": test_id})
+            if element:
+                text = element.get_text(strip=True)
                 if text:
-                    logger.debug("[STATUS] Источник: data-testid=%s -> %r", attr_val, text)
                     return text
 
         full_text = soup.get_text(" ", strip=True)
         match = _ONLINE_EXTRACT_RE.search(full_text)
         if match:
-            logger.debug("[STATUS] Источник: regex -> %r", match.group(0))
             return match.group(0)
-
-        logger.debug("[STATUS] Статус не найден")
         return None
 
     def _parse_description(self, soup: BeautifulSoup) -> str:
@@ -380,15 +384,15 @@ class OLXParser:
                 ad = data["props"]["pageProps"].get("ad") or {}
                 for key in ("description", "body", "text"):
                     value = ad.get(key)
-                    if value and isinstance(value, str) and len(value) > 10:
+                    if isinstance(value, str) and len(value) > 10:
                         return value.strip()
             except (KeyError, TypeError):
                 pass
 
-        for attr_val in ("ad-description", "description", "ad-body"):
-            el = soup.find(attrs={"data-testid": attr_val})
-            if el:
-                text = el.get_text(" ", strip=True)
+        for test_id in ("ad-description", "description", "ad-body"):
+            element = soup.find(attrs={"data-testid": test_id})
+            if element:
+                text = element.get_text(" ", strip=True)
                 if text:
                     return text
         return ""
@@ -402,28 +406,24 @@ class OLXParser:
                 ad = data["props"]["pageProps"].get("ad") or {}
                 for key in ("photos", "images", "media"):
                     items = ad.get(key)
-                    if items and isinstance(items, list):
-                        for item in items:
-                            if isinstance(item, dict):
-                                url = (
-                                    item.get("link")
-                                    or item.get("url")
-                                    or item.get("src")
-                                    or ""
-                                )
-                            else:
-                                url = str(item)
-                            if url and url.startswith("http"):
-                                images.append(url)
-                        if images:
-                            return images[:10]
+                    if not isinstance(items, list):
+                        continue
+                    for item in items:
+                        if isinstance(item, dict):
+                            url = item.get("link") or item.get("url") or item.get("src") or ""
+                        else:
+                            url = str(item)
+                        if url.startswith("http"):
+                            images.append(url)
+                    if images:
+                        return images[:10]
             except (KeyError, TypeError):
                 pass
 
         gallery = soup.find(attrs={"data-testid": "ad-photo-gallery"})
         target = gallery if gallery else soup
-        for img in target.find_all("img", src=True):
-            src = img["src"]
+        for image in target.find_all("img", src=True):
+            src = image["src"]
             if src.startswith("http") and "olx" in src and src not in images:
                 images.append(src)
             if len(images) >= 10:
@@ -454,7 +454,7 @@ class OLXParser:
             return None
         return self._find_reviews_count(page_props)
 
-    def _find_reviews_count(self, obj) -> Optional[int]:
+    def _find_reviews_count(self, obj: Any) -> Optional[int]:
         if isinstance(obj, dict):
             for key, value in obj.items():
                 key_norm = key.lower().replace("-", "").replace("_", "")
@@ -472,7 +472,7 @@ class OLXParser:
                     return nested
         return None
 
-    def _extract_count_candidate(self, value) -> Optional[int]:
+    def _extract_count_candidate(self, value: Any) -> Optional[int]:
         if isinstance(value, bool):
             return None
         if isinstance(value, int) and value >= 0:
@@ -501,18 +501,19 @@ class OLXParser:
             page_props = data["props"]["pageProps"]
             ad = page_props.get("ad") or {}
             user = ad.get("user") or page_props.get("user") or {}
-            for key in (
-                "lastSeenAt",
-                "last_seen_at",
-                "lastSeen",
-                "onlineStatus",
-                "online_status",
-            ):
-                value = user.get(key)
-                if value:
-                    return str(value)
         except (KeyError, TypeError):
-            pass
+            return None
+
+        for key in (
+            "lastSeenAt",
+            "last_seen_at",
+            "lastSeen",
+            "onlineStatus",
+            "online_status",
+        ):
+            value = user.get(key)
+            if value:
+                return str(value)
         return None
 
     @staticmethod
@@ -535,7 +536,7 @@ class OLXParser:
         callback: Optional[ProgressCallback],
         phase: str,
         stats: SearchStats,
-        **extra,
+        **extra: Any,
     ) -> None:
         if not callback:
             return
@@ -552,13 +553,14 @@ class OLXParser:
         try:
             await callback(payload)
         except Exception:
-            logger.exception("Ошибка progress callback")
+            logger.exception("Progress callback failed")
 
     async def search(
         self,
         query: str,
         max_pages: int = 3,
         max_check: int = 30,
+        category_path: str = "",
         review_filter: str = "any",
         progress_callback: Optional[ProgressCallback] = None,
     ) -> SearchResult:
@@ -566,37 +568,45 @@ class OLXParser:
             max_pages=max_pages,
             max_check=max_check,
             review_filter=review_filter,
+            category_path=category_path.strip("/"),
         )
 
-        logger.info("═" * 55)
+        logger.info("=" * 55)
         logger.info(
-            "[SEARCH] Запрос: %r | страниц=%d | лимит=%d | отзывы=%s",
+            "[SEARCH] query=%r category=%s pages=%d limit=%d reviews=%s",
             query,
+            stats.category_path or "all",
             max_pages,
             max_check,
             review_filter,
         )
-        logger.info("═" * 55)
+        logger.info("=" * 55)
 
         all_listings: list[dict] = []
         seen_urls: set[str] = set()
 
         for page in range(1, max_pages + 1):
-            cards = await self._fetch_listings_page(query, page, stats)
+            cards = await self._fetch_listings_page(
+                query,
+                page,
+                stats,
+                category_path=stats.category_path,
+            )
             if not cards:
-                logger.info("[SEARCH] Стр.%d пуста — останавливаемся", page)
+                logger.info("[SEARCH] page=%d empty, stopping", page)
                 break
 
             new_count = 0
             for card in cards:
-                if card["url"] and card["url"] not in seen_urls:
-                    seen_urls.add(card["url"])
+                url = card.get("url", "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
                     all_listings.append(card)
                     new_count += 1
 
             stats.listings_seen = len(all_listings)
             logger.info(
-                "[SEARCH] Стр.%d: +%d новых | дублей: %d | итого: %d",
+                "[SEARCH] page=%d new=%d dup=%d total=%d",
                 page,
                 new_count,
                 len(cards) - new_count,
@@ -612,28 +622,19 @@ class OLXParser:
             await asyncio.sleep(random.uniform(config.REQUEST_DELAY_MIN, config.REQUEST_DELAY_MAX))
 
         if not all_listings:
-            logger.info("[SEARCH] Карточки не найдены")
+            logger.info("[SEARCH] no cards found")
             stats.finish()
-            await self._notify_progress(
-                progress_callback,
-                "done",
-                stats,
-                total=0,
-            )
+            await self._notify_progress(progress_callback, "done", stats, total=0)
             return SearchResult(listings=[], stats=stats)
 
         filtered: list[dict] = []
         to_check = all_listings[:max_check]
         total = len(to_check)
-        logger.info("[CHECK] Начинаем проверку %d объявлений...", total)
+        logger.info("[CHECK] start total=%d", total)
 
         for idx, listing in enumerate(to_check, start=1):
-            logger.info(
-                "[CHECK] %d/%d | %s",
-                idx,
-                total,
-                listing.get("title", "(без названия)")[:60],
-            )
+            title = listing.get("title", "(untitled)")[:60]
+            logger.info("[CHECK] %d/%d title=%s", idx, total, title)
 
             details = await self._fetch_listing_details(listing["url"], stats)
             stats.listings_checked = idx
@@ -643,12 +644,12 @@ class OLXParser:
             review_match = self._matches_review_filter(reviews_count, review_filter)
 
             logger.info(
-                "[CHECK] %d/%d | Онлайн: %s | Отзывы: %r | Фильтр отзывов: %s | Запросов: %d",
+                "[CHECK] %d/%d online=%s reviews=%r review_match=%s requests=%d",
                 idx,
                 total,
-                "ДА" if online else "нет",
+                "yes" if online else "no",
                 reviews_count,
-                "ДА" if review_match else "нет",
+                "yes" if review_match else "no",
                 stats.requests_made,
             )
 
@@ -670,23 +671,19 @@ class OLXParser:
             await asyncio.sleep(random.uniform(config.REQUEST_DELAY_MIN, config.REQUEST_DELAY_MAX))
 
         stats.finish()
-        logger.info("─" * 55)
+        logger.info("-" * 55)
         logger.info(
-            "[READY] %r | проверено: %d | онлайн: %d | запросов: %d | время: %.1fs",
+            "[READY] query=%r category=%s checked=%d matched=%d requests=%d elapsed=%.1fs",
             query,
+            stats.category_path or "all",
             stats.listings_checked,
             len(filtered),
             stats.requests_made,
             stats.elapsed,
         )
-        logger.info("═" * 55)
+        logger.info("=" * 55)
 
-        await self._notify_progress(
-            progress_callback,
-            "done",
-            stats,
-            total=total,
-        )
+        await self._notify_progress(progress_callback, "done", stats, total=total)
         return SearchResult(listings=filtered, stats=stats)
 
     async def close(self) -> None:

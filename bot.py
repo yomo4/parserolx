@@ -1,7 +1,7 @@
 """
 Telegram-бот для парсинга OLX.ro.
 Принимает поисковый запрос и перед запуском показывает
-инлайн-настройки парсинга.
+инлайн-настройки парсинга, включая выбор категории.
 """
 
 import asyncio
@@ -44,6 +44,42 @@ REVIEW_FILTER_LABELS = {
     "without": "без отзывов",
 }
 
+CATEGORY_OPTIONS = {
+    "all": {"label": "Все категории", "path": ""},
+    "electronics": {
+        "label": "Электроника",
+        "path": "electronice-si-electrocasnice",
+    },
+    "auto": {
+        "label": "Авто",
+        "path": "auto-masini-moto-ambarcatiuni",
+    },
+    "realty": {
+        "label": "Недвижимость",
+        "path": "imobiliare",
+    },
+    "jobs": {
+        "label": "Работа",
+        "path": "locuri-de-munca",
+    },
+    "home": {
+        "label": "Дом и сад",
+        "path": "casa-gradina",
+    },
+    "kids": {
+        "label": "Мама и ребенок",
+        "path": "mama-si-copilul",
+    },
+    "pets": {
+        "label": "Животные",
+        "path": "animale-de-companie",
+    },
+    "fashion": {
+        "label": "Мода",
+        "path": "moda-frumusete",
+    },
+}
+
 
 def _option_values(default_value: int, preset_values: tuple[int, ...]) -> tuple[int, ...]:
     values = set(preset_values)
@@ -67,8 +103,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         f"👋 {hbold('OLX.ro Parser Bot')}\n\n"
         "Отправьте ключевое слово для поиска.\n"
         "После этого бот покажет инлайн-настройки:\n"
-        "сколько объявлений проверять, сколько страниц сканировать\n"
-        "и искать ли только продавцов с отзывами.\n\n"
+        "категорию, глубину парсинга, страницы поиска и фильтр по отзывам.\n\n"
         f"Пример: {hcode('iPhone 14')} или {hcode('laptop asus')}\n\n"
         "Команды:\n"
         "/search — ввести запрос\n"
@@ -84,9 +119,10 @@ async def cmd_help(message: Message) -> None:
         f"{hbold('ℹ️ Как пользоваться ботом:')}\n\n"
         "1. Отправьте поисковый запрос\n"
         "2. Выберите инлайн-настройки парсинга\n"
-        "3. Запустите поиск кнопкой «Запустить парсинг»\n"
+        "3. Нажмите «Запустить парсинг»\n"
         "4. Бот соберет объявления и проверит продавцов на онлайн сегодня\n\n"
         f"{hbold('Что можно настроить:')}\n"
+        "• категорию OLX\n"
         "• сколько объявлений дополнительно проверять\n"
         "• сколько страниц поиска OLX просматривать\n"
         "• брать любых продавцов, только с отзывами или без отзывов\n\n"
@@ -95,6 +131,7 @@ async def cmd_help(message: Message) -> None:
         "• Activ azi\n"
         "• Activ la HH:MM\n\n"
         f"{hbold('Текущие дефолты:')}\n"
+        f"• Категория: {CATEGORY_OPTIONS['all']['label']}\n"
         f"• Страниц поиска: {config.MAX_PAGES}\n"
         f"• Объявлений на проверку: {config.MAX_LISTINGS_CHECK}\n"
         f"• Результатов в выдаче: до {config.MAX_RESULTS}",
@@ -184,6 +221,8 @@ async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> 
         await state.update_data(max_pages=int(parts[2]))
     elif action == "reviews" and len(parts) == 3:
         await state.update_data(review_filter=parts[2])
+    elif action == "category" and len(parts) == 3 and parts[2] in CATEGORY_OPTIONS:
+        await state.update_data(category_key=parts[2])
     else:
         await callback.answer()
         return
@@ -223,6 +262,7 @@ async def _open_search_settings(message: Message, state: FSMContext, query: str)
             pass
 
     settings = {
+        "category_key": existing.get("category_key", "all"),
         "max_check": existing.get("max_check", config.MAX_LISTINGS_CHECK),
         "max_pages": existing.get("max_pages", config.MAX_PAGES),
         "review_filter": existing.get("review_filter", "any"),
@@ -248,7 +288,11 @@ async def _open_search_settings(message: Message, state: FSMContext, query: str)
 
 
 def _extract_settings(data: dict) -> dict:
+    category_key = str(data.get("category_key", "all"))
+    if category_key not in CATEGORY_OPTIONS:
+        category_key = "all"
     return {
+        "category_key": category_key,
         "max_check": int(data.get("max_check", config.MAX_LISTINGS_CHECK)),
         "max_pages": int(data.get("max_pages", config.MAX_PAGES)),
         "review_filter": str(data.get("review_filter", "any")),
@@ -259,6 +303,7 @@ def _build_settings_text(query: str, settings: dict) -> str:
     return (
         "⚙️ <b>Настройки парсинга</b>\n\n"
         f"Запрос: <code>{escape(query)}</code>\n"
+        f"Категория: <b>{CATEGORY_OPTIONS[settings['category_key']]['label']}</b>\n"
         f"Объявлений на проверку: <b>{settings['max_check']}</b>\n"
         f"Страниц поиска: <b>{settings['max_pages']}</b>\n"
         f"Отзывы: <b>{REVIEW_FILTER_LABELS[settings['review_filter']]}</b>\n\n"
@@ -271,6 +316,61 @@ def _build_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
         return f"✅ {label}" if selected else label
 
     rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text=mark(settings["category_key"] == "all", CATEGORY_OPTIONS["all"]["label"]),
+                callback_data="cfg:category:all",
+            ),
+            InlineKeyboardButton(
+                text=mark(
+                    settings["category_key"] == "electronics",
+                    CATEGORY_OPTIONS["electronics"]["label"],
+                ),
+                callback_data="cfg:category:electronics",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=mark(settings["category_key"] == "auto", CATEGORY_OPTIONS["auto"]["label"]),
+                callback_data="cfg:category:auto",
+            ),
+            InlineKeyboardButton(
+                text=mark(
+                    settings["category_key"] == "realty",
+                    CATEGORY_OPTIONS["realty"]["label"],
+                ),
+                callback_data="cfg:category:realty",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=mark(settings["category_key"] == "jobs", CATEGORY_OPTIONS["jobs"]["label"]),
+                callback_data="cfg:category:jobs",
+            ),
+            InlineKeyboardButton(
+                text=mark(settings["category_key"] == "home", CATEGORY_OPTIONS["home"]["label"]),
+                callback_data="cfg:category:home",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=mark(settings["category_key"] == "kids", CATEGORY_OPTIONS["kids"]["label"]),
+                callback_data="cfg:category:kids",
+            ),
+            InlineKeyboardButton(
+                text=mark(settings["category_key"] == "pets", CATEGORY_OPTIONS["pets"]["label"]),
+                callback_data="cfg:category:pets",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=mark(
+                    settings["category_key"] == "fashion",
+                    CATEGORY_OPTIONS["fashion"]["label"],
+                ),
+                callback_data="cfg:category:fashion",
+            )
+        ],
         [
             InlineKeyboardButton(
                 text=mark(settings["max_check"] == value, str(value)),
@@ -341,6 +441,7 @@ async def run_search(message: Message, query: str, settings: dict) -> None:
             query,
             max_pages=settings["max_pages"],
             max_check=settings["max_check"],
+            category_path=CATEGORY_OPTIONS[settings["category_key"]]["path"],
             review_filter=settings["review_filter"],
             progress_callback=on_progress,
         )
@@ -371,6 +472,7 @@ async def _show_search_result(
         )
         await message.answer(
             f"😔 По запросу {hbold(query)} ничего не найдено.\n"
+            f"Категория: {hbold(CATEGORY_OPTIONS[settings['category_key']]['label'])}\n"
             f"Фильтр по отзывам: {hbold(REVIEW_FILTER_LABELS[settings['review_filter']])}",
             parse_mode="HTML",
         )
@@ -423,6 +525,7 @@ def _build_status_text(query: str, settings: dict, progress: dict | None = None)
         (
             f"⚙️ До {settings['max_check']} объявлений, "
             f"{settings['max_pages']} стр., "
+            f"категория: {CATEGORY_OPTIONS[settings['category_key']]['label']}, "
             f"отзывы: {REVIEW_FILTER_LABELS[settings['review_filter']]}"
         ),
     ]
@@ -455,6 +558,7 @@ def _build_status_text(query: str, settings: dict, progress: dict | None = None)
 def _build_completion_text(query: str, settings: dict, stats, found: int) -> str:
     lines = [
         f"✅ Поиск завершен: {hbold(query)}",
+        f"🗂 Категория: {CATEGORY_OPTIONS[settings['category_key']]['label']}",
         f"🔎 Проверено объявлений: {stats.listings_checked}",
         f"📄 Страниц поиска: {stats.pages_loaded}",
         f"🌐 Запросов к OLX: {stats.requests_made}",
