@@ -8,12 +8,14 @@ import json
 import logging
 import random
 import re
+import socket
 import time
 from typing import Optional
 from urllib.parse import quote
 
 import aiohttp
 from bs4 import BeautifulSoup
+from curl_cffi import requests as curl_requests
 
 import config
 
@@ -80,10 +82,35 @@ class OLXParser:
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(limit=5),
+                connector=aiohttp.TCPConnector(
+                    limit=5,
+                    family=socket.AF_INET,
+                    ssl=False,
+                    ttl_dns_cache=300,
+                ),
                 timeout=aiohttp.ClientTimeout(total=30),
             )
         return self._session
+
+    def _fetch_with_curl(self, url: str) -> Optional[str]:
+        try:
+            response = curl_requests.get(
+                url,
+                headers=self._build_headers(),
+                impersonate="chrome124",
+                timeout=30,
+                allow_redirects=True,
+                verify=False,
+            )
+            if response.status_code == 200:
+                text = response.text
+                logger.debug("CURL OK %d | %d bytes | %s",
+                             response.status_code, len(text), url)
+                return text
+            logger.warning("CURL HTTP %d | %s", response.status_code, url)
+        except Exception as exc:
+            logger.error("CURL ERROR | %r | %s", exc, url)
+        return None
 
     async def _fetch(self, url: str) -> Optional[str]:
         session = await self._get_session()
@@ -102,7 +129,10 @@ class OLXParser:
         except asyncio.TimeoutError:
             logger.error("TIMEOUT (%.2fs) | %s", time.monotonic() - t0, url)
         except aiohttp.ClientError as exc:
-            logger.error("CLIENT ERROR | %s | %s", exc, url)
+            logger.warning("AIOHTTP ERROR | %r | %s", exc, url)
+            text = await asyncio.to_thread(self._fetch_with_curl, url)
+            if text:
+                return text
         return None
 
     # ─── Страница поиска ──────────────────────────────────────────────────────
