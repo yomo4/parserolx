@@ -1109,6 +1109,11 @@ async def _show_search_result(
             await message.answer(caption, parse_mode="HTML", disable_web_page_preview=True)
         await asyncio.sleep(0.5)
 
+    await message.answer(
+        _build_final_summary_text(query, settings, stats, listings, shown),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
     await _send_home(message, requester_id)
 
 
@@ -1159,6 +1164,47 @@ def _build_completion_text(query: str, settings: dict, stats, found: int) -> str
     if getattr(stats, "already_seen_skipped", 0):
         lines.append(f"♻️ Уже показывались раньше: {stats.already_seen_skipped}")
         lines.append(f"🧠 Память ссылок: {config.SEEN_LINK_TTL_HOURS} ч.")
+    return "\n".join(lines)
+
+
+def _build_final_summary_text(
+    query: str,
+    settings: dict,
+    stats,
+    listings: list[dict],
+    shown: int,
+) -> str:
+    total_found = len(listings)
+    summary_list = listings[:shown]
+    lines = [
+        "📋 <b>Сводка парсинга</b>",
+        "",
+        f"Цель: <b>{escape(_search_target_text(query, settings))}</b>",
+        f"Категория: <b>{escape(CATEGORY_OPTIONS[settings['category_key']]['label'])}</b>",
+        f"Проверено объявлений: <b>{stats.listings_checked}</b>",
+        f"Страниц поиска: <b>{stats.pages_loaded}</b>",
+        f"Запросов к OLX: <b>{stats.requests_made}</b>",
+        f"Найдено новых объявлений: <b>{total_found}</b>",
+        f"Фильтр отзывов: <b>{escape(REVIEW_FILTER_LABELS[settings['review_filter']])}</b>",
+        f"Время: <b>{stats.elapsed:.1f} сек.</b>",
+    ]
+    if getattr(stats, "already_seen_skipped", 0):
+        lines.append(f"Уже показанных ранее пропущено: <b>{stats.already_seen_skipped}</b>")
+
+    lines.append("")
+    lines.append(f"<b>Ссылки на объявления:</b> <i>первые {shown} из {total_found}</i>")
+    if not summary_list:
+        lines.append("Нет новых ссылок.")
+    else:
+        for idx, listing in enumerate(summary_list, start=1):
+            title = escape((listing.get("title") or "Объявление")[:70])
+            url = str(listing.get("url") or "").strip()
+            if url:
+                safe_url = escape(url, quote=True)
+                lines.append(f"{idx}. <a href='{safe_url}'>{title}</a>")
+            else:
+                lines.append(f"{idx}. {title}")
+
     return "\n".join(lines)
 
 
