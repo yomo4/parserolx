@@ -63,6 +63,14 @@ _SELLER_BUSINESS_RE = re.compile(
     r"\b(?:firma|companie|company|business|persoana juridica)\b",
     re.IGNORECASE,
 )
+_BUSINESS_ONLY_RE = re.compile(
+    r"(?:returneaza produsul|returneaz[ăa] produsul|cumparat de la o firma|cump[ăa]rat de la o firm[ăa]|aranja returul)",
+    re.IGNORECASE,
+)
+_BUSINESS_NAME_HINT_RE = re.compile(
+    r"(?:www\.|\.ro\b|\bsrl\b|\bshop\b|\bstore\b|\boutlet\b|\bmarket\b|\bmagazin\b|\bamanet\b|\batelier\b|\bservice\b|\btelefon(?:e|ulor)?\b|\bproduse?\b|\bgradina\b|\bg[sz]m\b|\bprintlab\b|\boffroad\b)",
+    re.IGNORECASE,
+)
 _VISIBLE_TEXT_SKIP_TAGS = {"script", "style", "noscript", "svg", "path", "meta", "link", "head", "title"}
 _SELLER_BLOCK_HINTS = ("seller", "user", "profile", "contact", "owner", "account")
 _SELLER_NAME_EXCLUDE_PREFIXES = (
@@ -588,13 +596,28 @@ class OLXParser:
             if not text:
                 continue
             normalized = self._normalize_match_text(text)
-            if normalized in {"privat", "companie", "business"}:
+            if normalized in {"privat", "companie", "business", "firma"}:
                 continue
-            if len(text) <= 40 and re.fullmatch(r"[A-Za-zA-ZÀ-ÿ0-9 .'\-]+", text):
+            if any(normalized.startswith(prefix) for prefix in _SELLER_NAME_EXCLUDE_PREFIXES):
+                continue
+            if _MONTH_YEAR_RE.fullmatch(normalized):
+                continue
+            if any(char.isdigit() for char in normalized):
+                continue
+            if len(text) <= 40 and re.fullmatch(r"[A-Za-zА-Яа-яÀ-ÿ .'\-]+", text):
                 parent_text = self._normalize_match_text(element.parent.get_text(" ", strip=True)) if element.parent else ""
                 if "activ" in parent_text or "rating" in parent_text or "olx din" in parent_text:
                     return text.strip()
         return None
+
+    @staticmethod
+    def _looks_like_business_name(name: Optional[str]) -> bool:
+        if not name:
+            return False
+        normalized = re.sub(r"\s+", " ", str(name)).strip()
+        if not normalized:
+            return False
+        return bool(_BUSINESS_NAME_HINT_RE.search(normalized))
 
     def _iter_seller_blocks(self, soup: BeautifulSoup):
         seen: set[int] = set()
@@ -753,6 +776,15 @@ class OLXParser:
             except (KeyError, TypeError):
                 pass
 
+        for text in self._visible_text_chunks(soup, limit=400):
+            normalized = self._normalize_match_text(text)
+            if len(normalized) > 32:
+                continue
+            if normalized in {"persoana fizica", "private", "privat"}:
+                return "private"
+            if normalized in {"firma", "companie", "company", "business", "persoana juridica"}:
+                return "business"
+
         seller_texts = self._collect_seller_texts(soup)
         seller_type = self._extract_seller_type_from_texts(seller_texts)
         if seller_type:
@@ -765,7 +797,18 @@ class OLXParser:
             if _SELLER_PRIVATE_RE.search(self._normalize_match_text(text))
             or _SELLER_BUSINESS_RE.search(self._normalize_match_text(text))
         ]
-        return self._extract_seller_type_from_texts(account_texts)
+        seller_type = self._extract_seller_type_from_texts(account_texts)
+        if seller_type:
+            return seller_type
+
+        for text in self._visible_text_chunks(soup, limit=400):
+            if _BUSINESS_ONLY_RE.search(self._normalize_match_text(text)):
+                return "business"
+
+        seller_name = self._parse_seller_name(soup)
+        if self._looks_like_business_name(seller_name):
+            return "business"
+        return None
 
     def _parse_seller_rating_value(self, soup: BeautifulSoup) -> Optional[str]:
         data = self._get_nextdata(soup)
@@ -1120,13 +1163,22 @@ class OLXParser:
             return reviews_count in (None, 0)
         return True
 
-    @staticmethod
-    def _matches_seller_type_filter(seller_type: Optional[str], review_filter: str) -> bool:
+    @classmethod
+    def _matches_seller_type_filter(
+        cls,
+        seller_type: Optional[str],
+        review_filter: str,
+        seller_name: Optional[str] = None,
+    ) -> bool:
         normalized = (seller_type or "").strip().lower()
         if normalized == "business":
             return False
         if review_filter == "without":
-            return normalized == "private"
+            if normalized == "private":
+                return True
+            if not normalized:
+                return not cls._looks_like_business_name(seller_name)
+            return False
         return True
 
     async def _notify_progress(
@@ -1248,7 +1300,11 @@ class OLXParser:
             online = self.is_online_today(details["last_online"])
             reviews_count = details["reviews_count"]
             seller_type = details.get("seller_type")
-            seller_match = self._matches_seller_type_filter(seller_type, review_filter)
+            seller_match = self._matches_seller_type_filter(
+                seller_type,
+                review_filter,
+                details.get("seller_name"),
+            )
             review_match = self._matches_review_filter(
                 reviews_count,
                 review_filter,

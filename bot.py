@@ -75,8 +75,24 @@ ADMIN_CODE_DURATIONS = (7, 30, 90, 365)
 SETTINGS_PAGE_LABELS = {
     "main": "Основное",
     "category": "Категории",
+    "city": "Города",
     "limits": "Фильтры",
 }
+CITY_PRESET_OPTIONS = (
+    ("bucuresti", "Bucuresti"),
+    ("cluj", "Cluj-Napoca"),
+    ("iasi", "Iasi"),
+    ("timisoara", "Timisoara"),
+    ("constanta", "Constanta"),
+    ("brasov", "Brasov"),
+    ("craiova", "Craiova"),
+    ("oradea", "Oradea"),
+    ("sibiu", "Sibiu"),
+    ("ploiesti", "Ploiesti"),
+    ("arad", "Arad"),
+    ("galati", "Galati"),
+)
+CITY_PRESET_MAP = dict(CITY_PRESET_OPTIONS)
 
 
 class SearchState(StatesGroup):
@@ -649,6 +665,40 @@ def _build_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
         ]
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
+    if page == "city":
+        rows: list[list[InlineKeyboardButton]] = []
+        for index in range(0, len(CITY_PRESET_OPTIONS), 2):
+            pair = CITY_PRESET_OPTIONS[index : index + 2]
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=mark(settings["city_filter"] == city_name, city_name),
+                        callback_data=f"cfg:citypick:{city_key}",
+                    )
+                    for city_key, city_name in pair
+                ]
+            )
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton(text="⌨️ Вручную", callback_data="cfg:city:set"),
+                    InlineKeyboardButton(
+                        text="🧹 Сбросить" if settings.get("city_filter") else "🌍 Вся страна",
+                        callback_data="cfg:city:clear",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(text="⬅️ Основное", callback_data="cfg:page:main"),
+                    InlineKeyboardButton(text="➡️ Фильтры", callback_data="cfg:page:limits"),
+                ],
+                [
+                    InlineKeyboardButton(text="🚀 Запустить", callback_data="cfg:start"),
+                    InlineKeyboardButton(text="✖️ В меню", callback_data="cfg:cancel"),
+                ],
+            ]
+        )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
     if page == "limits":
         rows = [
             [
@@ -700,12 +750,12 @@ def _build_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(
-                text=f"🏙 {_city_button_label(settings.get('city_filter', ''))}",
-                callback_data="cfg:city:set",
+                text="🏙 Города",
+                callback_data="cfg:page:city",
             ),
             InlineKeyboardButton(
-                text="🧹 Сбросить" if settings.get("city_filter") else "🌍 Вся страна",
-                callback_data="cfg:city:clear",
+                text=f"📍 {_city_button_label(settings.get('city_filter', ''))}",
+                callback_data="cfg:page:city",
             ),
         ],
         [
@@ -1090,7 +1140,7 @@ async def handle_new_query_during_config(message: Message, state: FSMContext) ->
             state,
             str(data.get("query", "")),
             search_mode=str(data.get("search_mode", "query")),
-            settings_page="main",
+            settings_page="city",
         )
         return
     await _open_search_settings(message, state, (message.text or "").strip(), search_mode="query")
@@ -1199,7 +1249,7 @@ async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> 
     elif action == "city" and len(parts) == 3:
         city_action = parts[2]
         if city_action == "set":
-            await state.update_data(input_target="city", settings_page="main")
+            await state.update_data(input_target="city", settings_page="city")
             await callback.message.answer(
                 "🏙 <b>Фильтр по городу</b>\n\n"
                 "<blockquote><b>Отправьте название города одним сообщением</b>\n"
@@ -1210,10 +1260,16 @@ async def handle_config_callback(callback: CallbackQuery, state: FSMContext) -> 
             await callback.answer("Жду название города")
             return
         if city_action == "clear":
-            await state.update_data(city_filter="", input_target=None, settings_page="main")
+            await state.update_data(city_filter="", input_target=None, settings_page="city")
         else:
             await callback.answer()
             return
+    elif action == "citypick" and len(parts) == 3:
+        city_value = CITY_PRESET_MAP.get(parts[2])
+        if city_value is None:
+            await callback.answer()
+            return
+        await state.update_data(city_filter=city_value, input_target=None, settings_page="city")
     elif action == "mode" and len(parts) == 3:
         new_mode = parts[2]
         if new_mode == "query":
