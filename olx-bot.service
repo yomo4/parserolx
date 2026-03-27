@@ -1,0 +1,22 @@
+[Unit]
+Description=OLX.ro Telegram Parser Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=olxbot
+Group=olxbot
+WorkingDirectory=/opt/olx-bot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/olx-bot/.env
+ExecStart=/opt/olx-bot/venv/bin/python /opt/olx-bot/bot.py
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=olx-bot
+
+[Install]
+WantedBy=multi-user.target
