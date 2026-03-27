@@ -14,6 +14,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -125,13 +126,38 @@ def _format_subscription_value(user_id: int) -> str:
     return f"активна до {_format_datetime(user.get('subscription_until'))} ({days}д {hours}ч)"
 
 
+def _access_status_text(user_id: int) -> str:
+    if _is_admin(user_id):
+        return "админ-доступ"
+    if db.has_active_subscription(user_id):
+        return "доступ открыт"
+    return "нужна подписка"
+
+
+def _build_block(title: str, lines: list[str], expandable: bool = False) -> str:
+    tag = "blockquote expandable" if expandable else "blockquote"
+    content = "\n".join(line for line in lines if line)
+    return f"<{tag}><b>{escape(title)}</b>\n{content}</{tag.split()[0]}>"
+
+
+def _progress_bar(current: int, total: int, width: int = 10) -> str:
+    if total <= 0:
+        return "░" * width
+    ratio = max(0.0, min(1.0, current / total))
+    filled = int(round(ratio * width))
+    return ("█" * filled) + ("░" * (width - filled))
+
+
 def _build_home_keyboard(user_id: int) -> InlineKeyboardMarkup:
     rows = [
         [
+            InlineKeyboardButton(text="⚡ Начать парс", callback_data="menu:start"),
             InlineKeyboardButton(text="👤 Профиль", callback_data="menu:profile"),
-            InlineKeyboardButton(text="🚀 Начать парс", callback_data="menu:start"),
         ],
-        [InlineKeyboardButton(text="💳 Моя подписка", callback_data="menu:subscription")],
+        [
+            InlineKeyboardButton(text="💳 Подписка", callback_data="menu:subscription"),
+            InlineKeyboardButton(text="ℹ️ Гайд", callback_data="menu:help"),
+        ],
     ]
     if _is_admin(user_id):
         rows.append([InlineKeyboardButton(text="🛠 Админ", callback_data="menu:admin")])
@@ -141,8 +167,12 @@ def _build_home_keyboard(user_id: int) -> InlineKeyboardMarkup:
 def _build_profile_keyboard(user_id: int) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton(text="🔑 Подписка", callback_data="menu:enter_code"),
-            InlineKeyboardButton(text="💳 Моя подписка", callback_data="menu:subscription"),
+            InlineKeyboardButton(text="🔑 Активировать код", callback_data="menu:enter_code"),
+            InlineKeyboardButton(text="💳 Подписка", callback_data="menu:subscription"),
+        ],
+        [
+            InlineKeyboardButton(text="⚡ Начать парс", callback_data="menu:start"),
+            InlineKeyboardButton(text="ℹ️ Гайд", callback_data="menu:help"),
         ],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:home")],
     ]
@@ -153,8 +183,27 @@ def _build_profile_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 def _build_subscription_keyboard(user_id: int) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text="🔑 Ввести код", callback_data="menu:enter_code")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:home")],
+        [
+            InlineKeyboardButton(text="🔑 Ввести код", callback_data="menu:enter_code"),
+            InlineKeyboardButton(text="⚡ Начать парс", callback_data="menu:start"),
+        ],
+        [
+            InlineKeyboardButton(text="ℹ️ Гайд", callback_data="menu:help"),
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:home"),
+        ],
+    ]
+    if _is_admin(user_id):
+        rows.insert(1, [InlineKeyboardButton(text="🛠 Админ", callback_data="menu:admin")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _build_help_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="⚡ Начать парс", callback_data="menu:start"),
+            InlineKeyboardButton(text="💳 Подписка", callback_data="menu:subscription"),
+        ],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")],
     ]
     if _is_admin(user_id):
         rows.insert(1, [InlineKeyboardButton(text="🛠 Админ", callback_data="menu:admin")])
@@ -196,12 +245,37 @@ def _build_search_entry_keyboard() -> InlineKeyboardMarkup:
 def _home_text(user_id: int) -> str:
     user = db.get_user(user_id) or {}
     username = f"@{user['username']}" if user.get("username") else "не указан"
-    return (
-        "👋 <b>OLX.ro Parser Bot</b>\n\n"
-        f"Профиль: <b>{escape(user.get('full_name') or 'Пользователь')}</b>\n"
-        f"Username: <b>{escape(username)}</b>\n"
-        f"Подписка: <b>{escape(_format_subscription_value(user_id))}</b>\n\n"
-        "Выберите действие ниже. Поиск доступен только с активной подпиской."
+    return "\n\n".join(
+        [
+            "✨ <b>SHAHRAY | OLX Parser</b>\n<i>Умный поиск активных продавцов на OLX.ro</i>",
+            _build_block(
+                "Ваш кабинет",
+                [
+                    f"Профиль: <b>{escape(user.get('full_name') or 'Пользователь')}</b>",
+                    f"Username: <b>{escape(username)}</b>",
+                    f"Доступ: <b>{escape(_access_status_text(user_id))}</b>",
+                    f"Подписка: <b>{escape(_format_subscription_value(user_id))}</b>",
+                ],
+            ),
+            _build_block(
+                "Быстрый старт",
+                [
+                    "1. Активируйте код в разделе подписки",
+                    "2. Нажмите «Начать парс»",
+                    "3. Выберите режим, категорию и фильтры",
+                ],
+            ),
+            _build_block(
+                "Что внутри",
+                [
+                    "• поиск по запросу и по категории",
+                    "• фильтры по PRIVAT, отзывам и лимитам",
+                    "• антидубль уже показанных ссылок",
+                    "• финальная сводка и прямые URL на лоты",
+                ],
+                expandable=True,
+            ),
+        ]
     )
 
 
@@ -209,42 +283,120 @@ def _profile_text(user_id: int) -> str:
     user = db.get_user(user_id) or {}
     username = f"@{user['username']}" if user.get("username") else "не указан"
     last_query = escape(user.get("last_query") or "нет")
-    return (
-        "👤 <b>Профиль</b>\n\n"
-        f"ID: <code>{user_id}</code>\n"
-        f"Имя: <b>{escape(user.get('full_name') or 'не указано')}</b>\n"
-        f"Username: <b>{escape(username)}</b>\n"
-        f"Регистрация: <b>{escape(_format_datetime(user.get('created_at')))}</b>\n"
-        f"Последняя активность: <b>{escape(_format_datetime(user.get('last_seen_at')))}</b>\n"
-        f"Поисков выполнено: <b>{user.get('total_searches', 0)}</b>\n"
-        f"Последний запрос: <code>{last_query}</code>\n"
-        f"Подписка: <b>{escape(_format_subscription_value(user_id))}</b>"
+    return "\n\n".join(
+        [
+            "👤 <b>Профиль</b>\n<i>Личный кабинет пользователя</i>",
+            _build_block(
+                "Паспорт аккаунта",
+                [
+                    f"ID: <code>{user_id}</code>",
+                    f"Имя: <b>{escape(user.get('full_name') or 'не указано')}</b>",
+                    f"Username: <b>{escape(username)}</b>",
+                    f"Регистрация: <b>{escape(_format_datetime(user.get('created_at')))}</b>",
+                    f"Последняя активность: <b>{escape(_format_datetime(user.get('last_seen_at')))}</b>",
+                ],
+            ),
+            _build_block(
+                "Активность",
+                [
+                    f"Поисков выполнено: <b>{user.get('total_searches', 0)}</b>",
+                    f"Последний запрос: <code>{last_query}</code>",
+                    f"Подписка: <b>{escape(_format_subscription_value(user_id))}</b>",
+                ],
+            ),
+        ]
     )
 
 
 def _subscription_text(user_id: int) -> str:
     user = db.get_user(user_id) or {}
     redeemed_code = user.get("redeemed_code") or "еще не активировали"
-    return (
-        "💳 <b>Моя подписка</b>\n\n"
-        f"Статус: <b>{escape(_format_subscription_value(user_id))}</b>\n"
-        f"Последний код: <code>{escape(redeemed_code)}</code>\n\n"
-        "Нажмите <b>Ввести код</b>, чтобы активировать или продлить подписку."
+    return "\n\n".join(
+        [
+            "💳 <b>Подписка</b>\n<i>Управление доступом к парсингу</i>",
+            _build_block(
+                "Текущий статус",
+                [
+                    f"Доступ: <b>{escape(_access_status_text(user_id))}</b>",
+                    f"Подписка: <b>{escape(_format_subscription_value(user_id))}</b>",
+                    f"Последний код: <code>{escape(redeemed_code)}</code>",
+                ],
+            ),
+            _build_block(
+                "Что можно сделать",
+                [
+                    "• активировать новый код",
+                    "• продлить уже активную подписку",
+                    "• вернуться в поиск без ручного ввода команд",
+                ],
+            ),
+        ]
     )
 
 
 def _admin_text(admin_id: int) -> str:
     stats = db.get_stats()
-    return (
-        "🛠 <b>Админ-панель</b>\n\n"
-        f"Админ ID: <code>{admin_id}</code>\n"
-        f"Пользователей: <b>{stats['total_users']}</b>\n"
-        f"Активных подписок: <b>{stats['active_subscriptions']}</b>\n"
-        f"Всего кодов: <b>{stats['total_codes']}</b>\n"
-        f"Доступных кодов: <b>{stats['available_codes']}</b>\n"
-        f"Использовано кодов: <b>{stats['redeemed_codes']}</b>\n"
-        f"Рассылок: <b>{stats['total_broadcasts']}</b>\n\n"
-        "Выберите действие ниже."
+    return "\n\n".join(
+        [
+            "🛠 <b>Админ-панель</b>\n<i>Управление подписками, кодами и рассылками</i>",
+            _build_block(
+                "KPI бота",
+                [
+                    f"Админ ID: <code>{admin_id}</code>",
+                    f"Пользователей: <b>{stats['total_users']}</b>",
+                    f"Активных подписок: <b>{stats['active_subscriptions']}</b>",
+                    f"Всего кодов: <b>{stats['total_codes']}</b>",
+                    f"Доступных кодов: <b>{stats['available_codes']}</b>",
+                    f"Использовано кодов: <b>{stats['redeemed_codes']}</b>",
+                    f"Рассылок: <b>{stats['total_broadcasts']}</b>",
+                ],
+            ),
+            _build_block(
+                "Быстрые действия",
+                [
+                    "• генерация кодов 7 / 30 / 90 / 365 дней",
+                    "• массовая рассылка всем пользователям",
+                    "• просмотр статистики без выхода из бота",
+                ],
+            ),
+        ]
+    )
+
+
+def _help_text() -> str:
+    return "\n\n".join(
+        [
+            "🧭 <b>Гайд по боту</b>\n<i>Коротко, быстро и без лишнего</i>",
+            _build_block(
+                "Как работать",
+                [
+                    "1. Активируйте код подписки",
+                    "2. Нажмите «Начать парс»",
+                    "3. Выберите режим: запрос или категория",
+                    "4. Настройте лимиты и фильтры",
+                    "5. Получите карточки и финальную сводку со ссылками",
+                ],
+            ),
+            _build_block(
+                "Фильтры по отзывам",
+                [
+                    "• «С отзывами» ищет продавцов с видимым рейтингом или отзывами",
+                    "• «PRIVAT без отзывов» режет FIRMA/COMPANIE и оставляет частников без признаков отзывов",
+                    "• если Telegram/OLX не отдают точный блок рейтинга, бот пишет это в лог",
+                ],
+                expandable=True,
+            ),
+            _build_block(
+                "Команды",
+                [
+                    "/start — главное меню",
+                    "/search — новый парсинг",
+                    "/help — этот экран",
+                    "/cancel — отменить текущее действие",
+                    "/admin — админ-панель",
+                ],
+            ),
+        ]
     )
 
 
@@ -264,9 +416,18 @@ async def _send_home(message: Message, user_id: int) -> None:
 
 
 def _subscription_required_text() -> str:
-    return (
-        "🔒 <b>Доступ к парсингу закрыт</b>\n\n"
-        "Чтобы начать поиск, активируйте подписку кодом в разделе <b>Моя подписка</b>."
+    return "\n\n".join(
+        [
+            "🔒 <b>Доступ к парсингу закрыт</b>\n<i>Поиск доступен только с активной подпиской</i>",
+            _build_block(
+                "Что сделать дальше",
+                [
+                    "1. Откройте раздел подписки",
+                    "2. Введите код активации",
+                    "3. Вернитесь и запустите парсинг",
+                ],
+            ),
+        ]
     )
 
 
@@ -324,15 +485,33 @@ def _extract_settings(data: dict) -> dict:
 
 
 def _build_settings_text(query: str, settings: dict) -> str:
-    return (
-        "⚙️ <b>Настройки парсинга</b>\n\n"
-        f"Режим: <b>{_search_mode_label(settings['search_mode'])}</b>\n"
-        f"Запрос: <code>{escape(_display_query(query, settings))}</code>\n"
-        f"Категория: <b>{CATEGORY_OPTIONS[settings['category_key']]['label']}</b>\n"
-        f"Объявлений на проверку: <b>{settings['max_check']}</b>\n"
-        f"Страниц поиска: <b>{settings['max_pages']}</b>\n"
-        f"Отзывы: <b>{REVIEW_FILTER_LABELS[settings['review_filter']]}</b>\n\n"
-        "Режим без отзывов теперь пропускает только PRIVAT и режет FIRMA/COMPANIE."
+    return "\n\n".join(
+        [
+            "🎛 <b>Настройки парсинга</b>\n<i>Соберите сценарий поиска перед запуском</i>",
+            _build_block(
+                "Сценарий",
+                [
+                    f"Режим: <b>{_search_mode_label(settings['search_mode'])}</b>",
+                    f"Запрос: <code>{escape(_display_query(query, settings))}</code>",
+                    f"Категория: <b>{CATEGORY_OPTIONS[settings['category_key']]['label']}</b>",
+                ],
+            ),
+            _build_block(
+                "Лимиты и фильтры",
+                [
+                    f"Объявлений на проверку: <b>{settings['max_check']}</b>",
+                    f"Страниц поиска: <b>{settings['max_pages']}</b>",
+                    f"Отзывы: <b>{REVIEW_FILTER_LABELS[settings['review_filter']]}</b>",
+                ],
+            ),
+            _build_block(
+                "Важно",
+                [
+                    "Режим «PRIVAT без отзывов» режет FIRMA/COMPANIE и не пропускает карточки с признаками рейтинга.",
+                ],
+                expandable=True,
+            ),
+        ]
     )
 
 
@@ -449,24 +628,9 @@ async def cmd_help(message: Message, state: FSMContext) -> None:
     _sync_user(message.from_user)
     await state.clear()
     await message.answer(
-        f"{hbold('Как пользоваться ботом:')}\n\n"
-        "1. Откройте профиль или раздел подписки\n"
-        "2. Активируйте код подписки\n"
-        "3. Нажмите «Начать парс»\n"
-        "4. Выберите режим: по запросу или только по категории\n"
-        "5. Настройте категорию, страницы, количество объявлений и фильтр отзывов\n"
-        "6. Запустите поиск\n\n"
-        f"{hbold('Важно по фильтру отзывов:')}\n"
-        "• «с отзывами» пропускает только продавцов с подтвержденным количеством отзывов > 0\n"
-        "• «без отзывов» пропускает только продавцов, где явно найдено 0 отзывов\n"
-        "• если отзывы не удалось определить, бот не будет ошибочно считать их отсутствующими\n\n"
-        f"{hbold('Команды:')}\n"
-        "/start — главное меню\n"
-        "/search — начать поиск\n"
-        "/admin — админ-панель\n"
-        "/cancel — отменить текущее действие",
+        _help_text(),
         parse_mode="HTML",
-        reply_markup=_build_home_keyboard(message.from_user.id),
+        reply_markup=_build_help_keyboard(message.from_user.id),
     )
 
 
@@ -494,9 +658,11 @@ async def cmd_search(message: Message, state: FSMContext) -> None:
         return
     await state.set_state(SearchState.waiting_mode)
     await message.answer(
-        "Выберите режим парсинга:\n"
-        "• по запросу\n"
-        "• только по выбранной категории",
+        "⚡ <b>Старт парсинга</b>\n\n"
+        "<blockquote><b>Выберите режим</b>\n"
+        "🔎 По запросу — поиск по ключевой фразе\n"
+        "🗂 Только категория — просто свежая лента раздела</blockquote>",
+        parse_mode="HTML",
         reply_markup=_build_search_entry_keyboard(),
     )
 
@@ -524,7 +690,7 @@ async def handle_menu_callback(callback: CallbackQuery, state: FSMContext) -> No
     _sync_user(callback.from_user)
     action = callback.data.split(":", maxsplit=1)[1]
 
-    if action in {"home", "profile", "subscription", "admin"}:
+    if action in {"home", "profile", "subscription", "admin", "help"}:
         await state.clear()
 
     if action == "home":
@@ -554,12 +720,22 @@ async def handle_menu_callback(callback: CallbackQuery, state: FSMContext) -> No
         await callback.answer()
         return
 
+    if action == "help":
+        await _show_panel(
+            callback.message,
+            _help_text(),
+            _build_help_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+
     if action == "enter_code":
         await state.clear()
         await state.set_state(SubscriptionState.waiting_code)
         await callback.message.answer(
-            "🔑 Отправьте код подписки одним сообщением.\n\n"
-            f"Пример: {hcode('OLX-ABCD@7K9Q')}",
+            "🔑 <b>Активация подписки</b>\n\n"
+            "<blockquote><b>Отправьте код одним сообщением</b>\n"
+            f"Пример: {hcode('OLX-ABCD@7K9Q')}</blockquote>",
             parse_mode="HTML",
         )
         await callback.answer("Жду код подписки")
@@ -577,9 +753,11 @@ async def handle_menu_callback(callback: CallbackQuery, state: FSMContext) -> No
             return
         await state.set_state(SearchState.waiting_mode)
         await callback.message.answer(
-            "Выберите режим парсинга:\n"
-            "• по запросу\n"
-            "• только по выбранной категории",
+            "⚡ <b>Старт парсинга</b>\n\n"
+            "<blockquote><b>Выберите режим</b>\n"
+            "🔎 По запросу — поиск по ключевой фразе\n"
+            "🗂 Только категория — свежая лента нужного раздела</blockquote>",
+            parse_mode="HTML",
             reply_markup=_build_search_entry_keyboard(),
         )
         await callback.answer()
@@ -620,7 +798,11 @@ async def handle_search_mode_callback(callback: CallbackQuery, state: FSMContext
     mode = callback.data.split(":", maxsplit=1)[1]
     if mode == "query":
         await state.set_state(SearchState.waiting_query)
-        await callback.message.answer("🔎 Введите поисковый запрос:")
+        await callback.message.answer(
+            "🔎 <b>Поиск по запросу</b>\n\n"
+            "<blockquote><b>Введите ключевую фразу</b>\nНапример: <code>iphone 15 pro</code></blockquote>",
+            parse_mode="HTML",
+        )
         await callback.answer()
         return
 
@@ -1056,17 +1238,37 @@ async def _show_search_result(
         )
         if skipped_seen:
             await message.answer(
-                f"♻️ Для {hbold(_search_target_text(query, settings))} новых объявлений пока нет.\n"
-                f"Старых уже показанных пропущено: {hbold(str(skipped_seen))}\n"
-                f"Память по ссылкам: {hbold(str(config.SEEN_LINK_TTL_HOURS))} ч.\n"
-                f"Фильтр по отзывам: {hbold(REVIEW_FILTER_LABELS[settings['review_filter']])}",
+                "\n\n".join(
+                    [
+                        "♻️ <b>Новых объявлений пока нет</b>",
+                        _build_block(
+                            "Антидубль",
+                            [
+                                f"Цель: <b>{escape(_search_target_text(query, settings))}</b>",
+                                f"Уже показанных пропущено: <b>{skipped_seen}</b>",
+                                f"Память ссылок: <b>{config.SEEN_LINK_TTL_HOURS} ч.</b>",
+                                f"Фильтр отзывов: <b>{REVIEW_FILTER_LABELS[settings['review_filter']]}</b>",
+                            ],
+                        ),
+                    ]
+                ),
                 parse_mode="HTML",
             )
         else:
             await message.answer(
-                f"😔 Для {hbold(_search_target_text(query, settings))} ничего не найдено.\n"
-                f"Категория: {hbold(CATEGORY_OPTIONS[settings['category_key']]['label'])}\n"
-                f"Фильтр по отзывам: {hbold(REVIEW_FILTER_LABELS[settings['review_filter']])}",
+                "\n\n".join(
+                    [
+                        "😔 <b>По этому сценарию ничего не найдено</b>",
+                        _build_block(
+                            "Параметры поиска",
+                            [
+                                f"Цель: <b>{escape(_search_target_text(query, settings))}</b>",
+                                f"Категория: <b>{CATEGORY_OPTIONS[settings['category_key']]['label']}</b>",
+                                f"Фильтр отзывов: <b>{REVIEW_FILTER_LABELS[settings['review_filter']]}</b>",
+                            ],
+                        ),
+                    ]
+                ),
                 parse_mode="HTML",
             )
         await _send_home(message, requester_id)
@@ -1079,12 +1281,22 @@ async def _show_search_result(
         parse_mode="HTML",
     )
     await message.answer(
-        f"✅ Найдено {hbold(str(total))} новых объявлений. "
-        f"(показываю {shown} из {stats.listings_checked} проверенных)."
-        + (
-            f"\n♻️ Уже показывалось раньше и пропущено: {hbold(str(skipped_seen))}"
-            if skipped_seen
-            else ""
+        "\n\n".join(
+            [
+                "✅ <b>Новые объявления найдены</b>",
+                _build_block(
+                    "Краткий итог",
+                    [
+                        f"Найдено новых: <b>{total}</b>",
+                        f"Показываю сейчас: <b>{shown}</b> из <b>{stats.listings_checked}</b> проверенных",
+                        (
+                            f"Уже показывалось раньше: <b>{skipped_seen}</b>"
+                            if skipped_seen
+                            else "Дубликаты по памяти ссылок не обнаружены",
+                        ),
+                    ],
+                ),
+            ]
         ),
         parse_mode="HTML",
     )
@@ -1118,53 +1330,99 @@ async def _show_search_result(
 
 
 def _build_status_text(query: str, settings: dict, progress: dict | None = None) -> str:
-    lines = [
-        f"🔌 Ищу: {hbold(_search_target_text(query, settings))}",
-        (
-            f"⚙️ До {settings['max_check']} объявлений, "
-            f"{settings['max_pages']} стр., "
-            f"режим: {_search_mode_label(settings['search_mode'])}, "
-            f"категория: {CATEGORY_OPTIONS[settings['category_key']]['label']}, "
-            f"отзывы: {REVIEW_FILTER_LABELS[settings['review_filter']]}"
-        ),
-    ]
+    header = "⚡ <b>Парсинг запущен</b>\n<i>Бот собирает и проверяет объявления в реальном времени</i>"
+    scenario = _build_block(
+        "Сценарий",
+        [
+            f"Цель: <b>{escape(_search_target_text(query, settings))}</b>",
+            f"Режим: <b>{_search_mode_label(settings['search_mode'])}</b>",
+            f"Категория: <b>{CATEGORY_OPTIONS[settings['category_key']]['label']}</b>",
+            f"Фильтр: <b>{REVIEW_FILTER_LABELS[settings['review_filter']]}</b>",
+        ],
+    )
 
     if not progress:
-        lines.append("⏳ Готовлюсь к парсингу...")
-        return "\n".join(lines)
+        phase_block = _build_block(
+            "Статус",
+            [
+                "Стадия: <b>инициализация</b>",
+                "Прогресс: <code>░░░░░░░░░░</code>",
+                "Ожидание первого запроса к OLX...",
+            ],
+        )
+        return "\n\n".join([header, scenario, phase_block])
 
     if progress["phase"] == "collect":
-        lines.append(f"📄 Собираю объявления: страница {progress['page']}/{settings['max_pages']}")
-        lines.append(f"📦 Уникальных объявлений: {progress['collected']}")
+        progress_bar = _progress_bar(progress["page"], settings["max_pages"])
+        phase_block = _build_block(
+            "Сбор объявлений",
+            [
+                f"Прогресс: <code>{progress_bar}</code> {progress['page']}/{settings['max_pages']}",
+                f"Уникальных карточек: <b>{progress['collected']}</b>",
+                f"Запросов к OLX: <b>{progress['requests_made']}</b>",
+            ],
+        )
     elif progress["phase"] == "check":
-        lines.append(f"🧪 Проверяю продавцов: {progress['checked']}/{progress['total']}")
-        lines.append(f"🟢 Подошло сейчас: {progress['matched']}")
+        checked = progress["checked"]
+        total = max(progress.get("total", 0), 1)
+        progress_bar = _progress_bar(checked, total)
+        phase_lines = [
+            f"Прогресс: <code>{progress_bar}</code> {checked}/{total}",
+            f"Подошло сейчас: <b>{progress['matched']}</b>",
+            f"Запросов к OLX: <b>{progress['requests_made']}</b>",
+        ]
         current_title = progress.get("current_title")
         if current_title:
-            lines.append(f"📌 Сейчас: <code>{escape(current_title[:60])}</code>")
-    elif progress["phase"] == "done":
-        lines.append(f"✅ Проверка завершена. Найдено: {progress['matched']}")
+            phase_lines.append(f"Сейчас проверяю: <code>{escape(current_title[:60])}</code>")
+        phase_block = _build_block("Проверка продавцов", phase_lines)
+    else:
+        phase_block = _build_block(
+            "Финализация",
+            [
+                f"Найдено: <b>{progress['matched']}</b>",
+                f"Запросов к OLX: <b>{progress['requests_made']}</b>",
+                "Подготавливаю итоговую выдачу...",
+            ],
+        )
 
-    lines.append(f"🌐 Запросов к OLX: {progress['requests_made']}")
-    return "\n".join(lines)
+    return "\n\n".join([header, scenario, phase_block])
 
 
 def _build_completion_text(query: str, settings: dict, stats, found: int) -> str:
     lines = [
-        f"✅ Поиск завершен: {hbold(_search_target_text(query, settings))}",
-        f"🧭 Режим: {_search_mode_label(settings['search_mode'])}",
-        f"🗂 Категория: {CATEGORY_OPTIONS[settings['category_key']]['label']}",
-        f"🔎 Проверено объявлений: {stats.listings_checked}",
-        f"📄 Страниц поиска: {stats.pages_loaded}",
-        f"🌐 Запросов к OLX: {stats.requests_made}",
-        f"⭐ Фильтр отзывов: {REVIEW_FILTER_LABELS[settings['review_filter']]}",
-        f"🟢 Найдено онлайн: {found}",
-        f"⏱ Время: {stats.elapsed:.1f} сек.",
+        "✅ <b>Парсинг завершен</b>\n<i>Сессия обработки успешно закончена</i>",
+        _build_block(
+            "Итоги",
+            [
+                f"Цель: <b>{escape(_search_target_text(query, settings))}</b>",
+                f"Режим: <b>{_search_mode_label(settings['search_mode'])}</b>",
+                f"Категория: <b>{CATEGORY_OPTIONS[settings['category_key']]['label']}</b>",
+                f"Найдено онлайн: <b>{found}</b>",
+                f"Фильтр отзывов: <b>{REVIEW_FILTER_LABELS[settings['review_filter']]}</b>",
+            ],
+        ),
+        _build_block(
+            "Техническая сводка",
+            [
+                f"Проверено объявлений: <b>{stats.listings_checked}</b>",
+                f"Страниц поиска: <b>{stats.pages_loaded}</b>",
+                f"Запросов к OLX: <b>{stats.requests_made}</b>",
+                f"Время: <b>{stats.elapsed:.1f} сек.</b>",
+            ],
+            expandable=True,
+        ),
     ]
     if getattr(stats, "already_seen_skipped", 0):
-        lines.append(f"♻️ Уже показывались раньше: {stats.already_seen_skipped}")
-        lines.append(f"🧠 Память ссылок: {config.SEEN_LINK_TTL_HOURS} ч.")
-    return "\n".join(lines)
+        lines.append(
+            _build_block(
+                "Антидубль",
+                [
+                    f"Уже показывались раньше: <b>{stats.already_seen_skipped}</b>",
+                    f"Память ссылок: <b>{config.SEEN_LINK_TTL_HOURS} ч.</b>",
+                ],
+            )
+        )
+    return "\n\n".join(lines)
 
 
 def _build_final_summary_text(
@@ -1177,34 +1435,43 @@ def _build_final_summary_text(
     total_found = len(listings)
     summary_list = listings[:shown]
     lines = [
-        "📋 <b>Сводка парсинга</b>",
-        "",
-        f"Цель: <b>{escape(_search_target_text(query, settings))}</b>",
-        f"Категория: <b>{escape(CATEGORY_OPTIONS[settings['category_key']]['label'])}</b>",
-        f"Проверено объявлений: <b>{stats.listings_checked}</b>",
-        f"Страниц поиска: <b>{stats.pages_loaded}</b>",
-        f"Запросов к OLX: <b>{stats.requests_made}</b>",
-        f"Найдено новых объявлений: <b>{total_found}</b>",
-        f"Фильтр отзывов: <b>{escape(REVIEW_FILTER_LABELS[settings['review_filter']])}</b>",
-        f"Время: <b>{stats.elapsed:.1f} сек.</b>",
+        "📋 <b>Сводка парсинга</b>\n<i>Готовый отчет по текущему запуску</i>",
+        _build_block(
+            "Результат",
+            [
+                f"Цель: <b>{escape(_search_target_text(query, settings))}</b>",
+                f"Категория: <b>{escape(CATEGORY_OPTIONS[settings['category_key']]['label'])}</b>",
+                f"Проверено объявлений: <b>{stats.listings_checked}</b>",
+                f"Страниц поиска: <b>{stats.pages_loaded}</b>",
+                f"Запросов к OLX: <b>{stats.requests_made}</b>",
+                f"Найдено новых объявлений: <b>{total_found}</b>",
+                f"Фильтр отзывов: <b>{escape(REVIEW_FILTER_LABELS[settings['review_filter']])}</b>",
+                f"Время: <b>{stats.elapsed:.1f} сек.</b>",
+            ],
+        ),
     ]
     if getattr(stats, "already_seen_skipped", 0):
-        lines.append(f"Уже показанных ранее пропущено: <b>{stats.already_seen_skipped}</b>")
+        lines.append(
+            _build_block(
+                "Антидубль",
+                [f"Уже показанных ранее пропущено: <b>{stats.already_seen_skipped}</b>"],
+            )
+        )
 
-    lines.append("")
-    lines.append(f"<b>Прямые ссылки:</b> <i>первые {shown} из {total_found}</i>")
     if not summary_list:
-        lines.append("Нет новых ссылок.")
+        lines.append(_build_block("Прямые ссылки", ["Нет новых ссылок."]))
     else:
+        link_lines = [f"Первые {shown} из {total_found}:"]
         for idx, listing in enumerate(summary_list, start=1):
             url = str(listing.get("url") or "").strip()
             if url:
                 safe_url = escape(url, quote=True)
-                lines.append(f"{idx}. <a href='{safe_url}'>{safe_url}</a>")
+                link_lines.append(f"{idx}. <a href='{safe_url}'>{safe_url}</a>")
             else:
-                lines.append(f"{idx}. ссылка не найдена")
+                link_lines.append(f"{idx}. ссылка не найдена")
+        lines.append(_build_block("Прямые ссылки", link_lines, expandable=True))
 
-    return "\n".join(lines)
+    return "\n\n".join(lines)
 
 
 def _format_listing(idx: int, listing: dict) -> str:
@@ -1259,6 +1526,28 @@ def _escape_html(value: object) -> str:
     return escape(str(value), quote=False)
 
 
+async def _configure_bot_presentation() -> None:
+    commands = [
+        BotCommand(command="start", description="Открыть главное меню"),
+        BotCommand(command="search", description="Запустить новый парсинг"),
+        BotCommand(command="help", description="Показать гайд по боту"),
+        BotCommand(command="cancel", description="Отменить текущее действие"),
+    ]
+    if config.ADMIN_IDS:
+        commands.append(BotCommand(command="admin", description="Открыть админ-панель"))
+
+    try:
+        await bot.set_my_commands(commands)
+        await bot.set_my_description(
+            "Умный Telegram-бот для поиска активных PRIVAT-продавцов на OLX.ro с фильтрами, "
+            "антидублем и финальной сводкой по объявлениям."
+        )
+        await bot.set_my_short_description("Поиск активных продавцов и свежих объявлений на OLX.ro")
+        logger.info("Bot presentation configured")
+    except Exception:
+        logger.exception("Failed to configure bot presentation")
+
+
 async def on_shutdown(dispatcher: Dispatcher) -> None:
     await parser.close()
     db.close()
@@ -1267,6 +1556,7 @@ async def on_shutdown(dispatcher: Dispatcher) -> None:
 
 async def main() -> None:
     dp.shutdown.register(on_shutdown)
+    await _configure_bot_presentation()
     logger.info("Bot started")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
