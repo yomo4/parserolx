@@ -1120,6 +1120,19 @@ def _format_listing(idx: int, listing: dict) -> str:
         lines.append(f"💰 {_escape_html(listing['price'])}")
     if listing.get("location"):
         lines.append(f"📍 {_escape_html(listing['location'])}")
+    if listing.get("seller_type"):
+        normalized_type = str(listing["seller_type"]).lower()
+        if normalized_type == "private":
+            seller_type = "частник"
+        elif normalized_type == "business":
+            seller_type = "бизнес"
+        else:
+            seller_type = str(listing["seller_type"])
+        lines.append(f"👤 Тип: {_escape_html(seller_type)}")
+    if listing.get("seller_name"):
+        lines.append(f"🙍 Продавец: {_escape_html(listing['seller_name'])}")
+    if listing.get("seller_rating"):
+        lines.append(f"🏅 Рейтинг: {_escape_html(listing['seller_rating'])}/5")
     if listing.get("last_online"):
         lines.append(f"🟢 {_escape_html(listing['last_online'])}")
 

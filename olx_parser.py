@@ -48,14 +48,16 @@ _ONLINE_EXTRACT_RE = re.compile(
 )
 
 _REVIEWS_RE = re.compile(
-    r"(\d+)\s*(?:review(?:-uri)?|reviews|recenzii|evaluari|evalu\u0103ri|opinii)",
+    r"(\d+)\s*(?:review(?:-uri)?|reviews|recenzii|evaluari|evalu\u0103ri|opinii|ratinguri|ratings?)",
     re.IGNORECASE,
 )
 
 _NO_REVIEWS_RE = re.compile(
-    r"(?:fara\s+evaluari|f\u0103r\u0103\s+evalu\u0103ri|0\s+(?:review(?:-uri)?|reviews|recenzii|evaluari|evalu\u0103ri|opinii))",
+    r"(?:fara\s+evaluari|f\u0103r\u0103\s+evalu\u0103ri|fara\s+ratinguri|0\s+(?:review(?:-uri)?|reviews|recenzii|evaluari|evalu\u0103ri|opinii|ratinguri|ratings?))",
     re.IGNORECASE,
 )
+
+_SELLER_RATING_VALUE_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*/\s*5", re.IGNORECASE)
 
 _REVIEW_KEYS = {
     "reviewcount",
@@ -419,27 +421,49 @@ class OLXParser:
                 "description": "",
                 "images": [],
                 "reviews_count": None,
+                "seller_name": None,
+                "seller_type": None,
+                "seller_rating": None,
             }
 
         soup = BeautifulSoup(html, "lxml")
         status = self._parse_seller_status_from_soup(soup)
         description = self._parse_description(soup)
         images = self._parse_images(soup)
+        seller_name = self._parse_seller_name(soup)
+        seller_type = self._parse_seller_type(soup)
+        seller_rating = self._parse_seller_rating_value(soup)
         reviews_count = self._parse_reviews_count(soup)
+        seller_debug = self._collect_seller_debug(soup)
 
         logger.debug(
-            "[DETAIL] status=%r reviews=%r desc=%d images=%d url=%s",
+            "[DETAIL] seller=%r type=%r rating=%r status=%r reviews=%r desc=%d images=%d url=%s",
+            seller_name,
+            seller_type,
+            seller_rating,
             status,
             reviews_count,
             len(description),
             len(images),
             url,
         )
+        logger.info(
+            "[SELLER] type=%r name=%r rating=%r reviews=%r status=%r debug=%s",
+            seller_type,
+            seller_name,
+            seller_rating,
+            reviews_count,
+            status,
+            seller_debug,
+        )
         return {
             "last_online": status,
             "description": description,
             "images": images,
             "reviews_count": reviews_count,
+            "seller_name": seller_name,
+            "seller_type": seller_type,
+            "seller_rating": seller_rating,
         }
 
     def _parse_seller_status_from_soup(self, soup: BeautifulSoup) -> Optional[str]:
@@ -459,6 +483,142 @@ class OLXParser:
         if match:
             return match.group(0)
         return None
+
+    def _parse_seller_name(self, soup: BeautifulSoup) -> Optional[str]:
+        data = self._get_nextdata(soup)
+        if data:
+            try:
+                page_props = data["props"]["pageProps"]
+                ad = page_props.get("ad") or {}
+                user = ad.get("user") or page_props.get("user") or {}
+                for key in ("name", "sellerName", "userName", "username"):
+                    value = user.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+            except (KeyError, TypeError):
+                pass
+
+        for test_id in ("seller-name", "user-name", "aside-user-name", "profile-name"):
+            element = soup.find(attrs={"data-testid": test_id})
+            if element:
+                text = element.get_text(" ", strip=True)
+                if text:
+                    return text
+
+        # Fallback: seller card often contains a short proper-name line near the rating block.
+        candidates = soup.find_all(["h4", "h5", "h6", "span", "div"])
+        for element in candidates:
+            text = element.get_text(" ", strip=True)
+            if not text:
+                continue
+            normalized = self._normalize_match_text(text)
+            if normalized in {"privat", "companie", "business"}:
+                continue
+            if len(text) <= 40 and re.fullmatch(r"[A-Za-zA-ZÀ-ÿ0-9 .'\-]+", text):
+                parent_text = self._normalize_match_text(element.parent.get_text(" ", strip=True)) if element.parent else ""
+                if "activ" in parent_text or "rating" in parent_text or "olx din" in parent_text:
+                    return text.strip()
+        return None
+
+    def _parse_seller_type(self, soup: BeautifulSoup) -> Optional[str]:
+        data = self._get_nextdata(soup)
+        if data:
+            try:
+                page_props = data["props"]["pageProps"]
+                ad = page_props.get("ad") or {}
+                user = ad.get("user") or page_props.get("user") or {}
+                account_type = user.get("accountType") or user.get("type") or user.get("businessStatus")
+                if isinstance(account_type, str) and account_type.strip():
+                    normalized = self._normalize_match_text(account_type)
+                    if "private" in normalized or "privat" in normalized:
+                        return "private"
+                    if "business" in normalized or "companie" in normalized or "company" in normalized:
+                        return "business"
+            except (KeyError, TypeError):
+                pass
+
+        full_text = soup.get_text(" ", strip=True)
+        normalized = self._normalize_match_text(full_text)
+        if re.search(r"\bprivat\b", normalized):
+            return "private"
+        if re.search(r"\bcompanie\b|\bbusiness\b|\bdealer\b", normalized):
+            return "business"
+        return None
+
+    def _parse_seller_rating_value(self, soup: BeautifulSoup) -> Optional[str]:
+        data = self._get_nextdata(soup)
+        if data:
+            rating = self._find_seller_rating_value(data)
+            if rating is not None:
+                return rating
+
+        full_text = soup.get_text(" ", strip=True)
+        normalized = self._normalize_match_text(full_text)
+        match = _SELLER_RATING_VALUE_RE.search(normalized)
+        if match:
+            return match.group(1).replace(",", ".")
+        return None
+
+    def _find_seller_rating_value(self, obj: Any) -> Optional[str]:
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                key_norm = key.lower().replace("-", "").replace("_", "")
+                if "rating" in key_norm or "score" in key_norm:
+                    rating = self._extract_rating_candidate(value)
+                    if rating is not None:
+                        return rating
+                nested = self._find_seller_rating_value(value)
+                if nested is not None:
+                    return nested
+        elif isinstance(obj, list):
+            for item in obj:
+                nested = self._find_seller_rating_value(item)
+                if nested is not None:
+                    return nested
+        return None
+
+    def _extract_rating_candidate(self, value: Any) -> Optional[str]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            if 0 <= float(value) <= 5:
+                return f"{float(value):.1f}"
+            return None
+        if isinstance(value, str):
+            cleaned = value.replace(",", ".").strip()
+            if re.fullmatch(r"\d+(?:\.\d+)?", cleaned):
+                numeric = float(cleaned)
+                if 0 <= numeric <= 5:
+                    return f"{numeric:.1f}"
+        if isinstance(value, dict):
+            for nested_key in ("value", "score", "average", "rating"):
+                nested_value = value.get(nested_key)
+                rating = self._extract_rating_candidate(nested_value)
+                if rating is not None:
+                    return rating
+        return None
+
+    def _collect_seller_debug(self, soup: BeautifulSoup) -> str:
+        snippets: list[str] = []
+        seen: set[str] = set()
+        for element in soup.find_all(True):
+            data_testid = str(element.get("data-testid") or "")
+            classes = " ".join(element.get("class", [])) if isinstance(element.get("class"), list) else str(element.get("class") or "")
+            marker = f"{data_testid} {classes}".lower()
+            text = element.get_text(" ", strip=True)
+            if not text:
+                continue
+            normalized_text = self._normalize_match_text(text)
+            if any(token in marker for token in ("seller", "user", "profile", "rating", "review", "feedback")) or any(
+                token in normalized_text for token in ("privat", "companie", "rating", "review", "activ", "olx din")
+            ):
+                snippet = f"{data_testid or '-'}:{text[:140]}"
+                if snippet not in seen:
+                    seen.add(snippet)
+                    snippets.append(snippet)
+            if len(snippets) >= 8:
+                break
+        return " | ".join(snippets[:8]) if snippets else "no-seller-snippets"
 
     def _parse_description(self, soup: BeautifulSoup) -> str:
         data = self._get_nextdata(soup)
@@ -765,10 +925,13 @@ class OLXParser:
             review_match = self._matches_review_filter(reviews_count, review_filter)
 
             logger.info(
-                "[CHECK] %d/%d online=%s reviews=%r filter=%s review_match=%s requests=%d",
+                "[CHECK] %d/%d online=%s seller_type=%r seller=%r rating=%r reviews=%r filter=%s review_match=%s requests=%d",
                 idx,
                 total,
                 "yes" if online else "no",
+                details.get("seller_type"),
+                details.get("seller_name"),
+                details.get("seller_rating"),
                 reviews_count,
                 review_filter,
                 "yes" if review_match else "no",
@@ -780,6 +943,9 @@ class OLXParser:
                 listing["description"] = details["description"]
                 listing["images"] = details["images"]
                 listing["reviews_count"] = reviews_count
+                listing["seller_name"] = details.get("seller_name")
+                listing["seller_type"] = details.get("seller_type")
+                listing["seller_rating"] = details.get("seller_rating")
                 filtered.append(listing)
                 stats.listings_matched = len(filtered)
 
