@@ -6,6 +6,7 @@ review filtering, progress callbacks, and request statistics.
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import socket
@@ -51,9 +52,14 @@ _REVIEWS_RE = re.compile(
     r"(\d+)\s*(?:review(?:-uri)?|reviews|recenzii|evaluari|evalu\u0103ri|opinii|ratinguri|ratings?)",
     re.IGNORECASE,
 )
+_REVIEW_TEXT_PATTERNS = (
+    re.compile(r"(\d+)\s*opini[ei]?", re.IGNORECASE),
+    re.compile(r"(\d+)\s*recenz\w*", re.IGNORECASE),
+    _REVIEWS_RE,
+)
 
 _NO_REVIEWS_RE = re.compile(
-    r"(?:fara\s+evaluari|f\u0103r\u0103\s+evalu\u0103ri|fara\s+ratinguri|0\s+(?:review(?:-uri)?|reviews|recenzii|evaluari|evalu\u0103ri|opinii|ratinguri|ratings?))",
+    r"(?:fara\s+(?:evaluari|ratinguri|opinii|recenzii)|f\u0103r\u0103\s+(?:evalu\u0103ri|ratinguri|opinii|recenzii)|0\s+(?:review(?:-uri)?|reviews|recenzii|evaluari|evalu\u0103ri|opinii|ratinguri|ratings?))",
     re.IGNORECASE,
 )
 
@@ -141,6 +147,7 @@ class OLXParser:
     def __init__(self) -> None:
         self._session: Optional[aiohttp.ClientSession] = None
         self._cookie_header = self._load_cookie_header()
+        self._proxy_url = os.getenv("OLX_PROXY_URL", "").strip()
 
     @staticmethod
     def _build_search_slug(query: str) -> str:
@@ -174,7 +181,7 @@ class OLXParser:
             return False
         return city_norm in location_norm
 
-    def _build_headers(self) -> dict:
+    def _build_headers(self, *, referer: Optional[str] = None) -> dict:
         headers = {
             "User-Agent": random.choice(_USER_AGENTS),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
@@ -186,11 +193,35 @@ class OLXParser:
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Pragma": "no-cache",
             "Cache-Control": "max-age=0",
+            "DNT": "1",
         }
+        headers["Referer"] = referer or f"{self.BASE_URL}/"
         if self._cookie_header:
             headers["Cookie"] = self._cookie_header
         return headers
+
+    @staticmethod
+    def _looks_like_protection_page(html: str) -> bool:
+        normalized = re.sub(r"\s+", " ", html).lower()
+        return any(
+            token in normalized
+            for token in (
+                "datadome",
+                "access denied",
+                "verify you are human",
+                "captcha",
+                "just a moment",
+                "enable javascript",
+                "robot",
+            )
+        )
+
+    @staticmethod
+    def _request_pause(multiplier: float = 1.0) -> float:
+        return random.uniform(config.REQUEST_DELAY_MIN, config.REQUEST_DELAY_MAX) * max(multiplier, 0.25)
 
     @staticmethod
     def _normalize_match_text(text: str) -> str:
@@ -275,16 +306,17 @@ class OLXParser:
             )
         return self._session
 
-    def _fetch_with_curl(self, url: str, stats: SearchStats) -> Optional[str]:
+    def _fetch_with_curl(self, url: str, stats: SearchStats, *, referer: Optional[str] = None) -> Optional[str]:
         stats.requests_made += 1
         try:
             response = curl_requests.get(
                 url,
-                headers=self._build_headers(),
+                headers=self._build_headers(referer=referer),
                 impersonate="chrome124",
                 timeout=30,
                 allow_redirects=True,
                 verify=False,
+                proxy=self._proxy_url or None,
             )
         except Exception as exc:
             logger.error("CURL error | %r | %s", exc, url)
@@ -292,54 +324,75 @@ class OLXParser:
 
         if response.status_code == 200:
             text = response.text
+            if self._looks_like_protection_page(text):
+                logger.warning("CURL protection page detected | %s", url)
+                return None
             logger.debug("CURL ok | bytes=%d | %s", len(text), url)
             return text
 
         logger.warning("CURL http=%d | %s", response.status_code, url)
         return None
 
-    async def _fetch(self, url: str, stats: SearchStats) -> Optional[str]:
+    async def _fetch(self, url: str, stats: SearchStats, *, referer: Optional[str] = None) -> Optional[str]:
         session = await self._get_session()
-        stats.requests_made += 1
-        started = time.monotonic()
         logger.debug("GET %s", url)
 
-        try:
-            async with session.get(url, headers=self._build_headers()) as response:
-                elapsed = time.monotonic() - started
-                if response.status == 200:
-                    text = await response.text()
-                    logger.debug(
-                        "HTTP ok | status=%d | elapsed=%.2fs | bytes=%d | %s",
-                        response.status,
-                        elapsed,
-                        len(text),
-                        url,
-                    )
-                    return text
+        for attempt in range(1, 3):
+            stats.requests_made += 1
+            started = time.monotonic()
+            try:
+                async with session.get(
+                    url,
+                    headers=self._build_headers(referer=referer),
+                    proxy=self._proxy_url or None,
+                ) as response:
+                    elapsed = time.monotonic() - started
+                    if response.status == 200:
+                        text = await response.text()
+                        if self._looks_like_protection_page(text):
+                            logger.warning(
+                                "HTTP protection page | attempt=%d elapsed=%.2fs | %s",
+                                attempt,
+                                elapsed,
+                                url,
+                            )
+                        else:
+                            logger.debug(
+                                "HTTP ok | status=%d | elapsed=%.2fs | bytes=%d | %s",
+                                response.status,
+                                elapsed,
+                                len(text),
+                                url,
+                            )
+                            return text
+                    else:
+                        logger.warning(
+                            "HTTP bad status=%d | attempt=%d elapsed=%.2fs | %s",
+                            response.status,
+                            attempt,
+                            elapsed,
+                            url,
+                        )
+            except asyncio.TimeoutError:
+                logger.error("HTTP timeout | attempt=%d elapsed=%.2fs | %s", attempt, time.monotonic() - started, url)
+            except aiohttp.ClientError as exc:
+                status = getattr(exc, "status", None)
                 logger.warning(
-                    "HTTP bad status=%d | elapsed=%.2fs | %s",
-                    response.status,
-                    elapsed,
+                    "AIOHTTP error | type=%s status=%s | %s",
+                    exc.__class__.__name__,
+                    status if status is not None else "-",
                     url,
                 )
-                return None
-        except asyncio.TimeoutError:
-            logger.error("HTTP timeout | elapsed=%.2fs | %s", time.monotonic() - started, url)
-        except aiohttp.ClientError as exc:
-            status = getattr(exc, "status", None)
-            logger.warning(
-                "AIOHTTP error | type=%s status=%s | %s",
-                exc.__class__.__name__,
-                status if status is not None else "-",
-                url,
-            )
-            text = await asyncio.to_thread(self._fetch_with_curl, url, stats)
-            if text:
-                return text
+
+            if attempt < 2:
+                await asyncio.sleep(self._request_pause(multiplier=attempt))
+
+        text = await asyncio.to_thread(self._fetch_with_curl, url, stats, referer=referer)
+        if text:
+            return text
         return None
 
-    async def _fetch_listings_page(
+    async def parse_page(
         self,
         query: str,
         page: int,
@@ -349,7 +402,7 @@ class OLXParser:
         url = self._build_search_url(query, page, category_path)
         logger.info("[SEARCH] Page %d url=%s", page, url)
 
-        html = await self._fetch(url, stats)
+        html = await self._fetch(url, stats, referer=f"{self.BASE_URL}/")
         if not html:
             logger.warning("[SEARCH] Page %d returned empty body", page)
             return []
@@ -358,6 +411,15 @@ class OLXParser:
         cards = self._parse_listing_cards(html)
         logger.info("[SEARCH] Page %d cards=%d", page, len(cards))
         return cards
+
+    async def _fetch_listings_page(
+        self,
+        query: str,
+        page: int,
+        stats: SearchStats,
+        category_path: str = "",
+    ) -> list[dict]:
+        return await self.parse_page(query, page, stats, category_path)
 
     def _parse_listing_cards(self, html: str) -> list[dict]:
         soup = BeautifulSoup(html, "lxml")
@@ -417,6 +479,7 @@ class OLXParser:
                     "location": location,
                     "url": url,
                     "last_online": None,
+                    "offer_html": "",
                 }
             )
 
@@ -461,65 +524,170 @@ class OLXParser:
                 "location": location,
                 "url": url,
                 "last_online": None,
+                "offer_html": str(card),
             }
         except Exception as exc:
             logger.debug("Card extract error: %s", exc)
             return None
 
-    async def _fetch_listing_details(self, url: str, stats: SearchStats) -> dict:
-        logger.debug("[DETAIL] Loading %s", url)
-        html = await self._fetch(url, stats)
-        if not html:
-            logger.warning("[DETAIL] Empty response for %s", url)
-            return {
-                "last_online": None,
-                "description": "",
-                "images": [],
-                "reviews_count": None,
-                "reviews_source": "empty",
-                "has_review_signal": False,
-                "has_no_reviews_signal": False,
-                "seller_name": None,
-                "seller_type": None,
-                "seller_rating": None,
-            }
+    @staticmethod
+    def _empty_offer_details() -> dict:
+        return {
+            "last_online": None,
+            "description": "",
+            "images": [],
+            "reviews_count": None,
+            "reviews_source": "empty",
+            "has_review_signal": False,
+            "has_no_reviews_signal": False,
+            "seller_name": None,
+            "seller_type": None,
+            "seller_rating": None,
+            "offer_html": "",
+        }
 
-        soup = BeautifulSoup(html, "lxml")
+    def _build_review_info(
+        self,
+        *,
+        reviews_count: Optional[int],
+        seller_rating: Optional[str],
+        source: str,
+        offer_html: str,
+    ) -> dict:
+        rating_value = self._extract_rating_number(seller_rating)
+        has_review_signal = bool((reviews_count is not None and reviews_count > 0) or (rating_value and rating_value > 0))
+        has_no_reviews_signal = reviews_count == 0
+        return {
+            "reviews_count": reviews_count,
+            "reviews_source": source,
+            "has_review_signal": has_review_signal,
+            "has_no_reviews_signal": has_no_reviews_signal,
+            "seller_rating": seller_rating,
+            "offer_html": offer_html,
+        }
+
+    def _extract_seller_review_info_from_html(self, offer_html: str, *, source_label: str) -> dict:
+        soup = BeautifulSoup(offer_html, "lxml")
+        seller_rating = self._parse_seller_rating_value(soup)
+
+        reviews_count = self._extract_reviews_count_nextdata(soup)
+        if reviews_count is not None:
+            return self._build_review_info(
+                reviews_count=reviews_count,
+                seller_rating=seller_rating,
+                source=f"{source_label}:nextdata",
+                offer_html=offer_html,
+            )
+
+        reviews_count = self._extract_reviews_count_from_review_nodes(soup)
+        if reviews_count is not None:
+            return self._build_review_info(
+                reviews_count=reviews_count,
+                seller_rating=seller_rating,
+                source=f"{source_label}:review_nodes",
+                offer_html=offer_html,
+            )
+
+        seller_texts = self._collect_seller_texts(soup)
+        reviews_count = self._extract_reviews_count_from_texts(seller_texts)
+        if reviews_count is not None:
+            return self._build_review_info(
+                reviews_count=reviews_count,
+                seller_rating=seller_rating,
+                source=f"{source_label}:seller_text",
+                offer_html=offer_html,
+            )
+
+        rating_value = self._extract_rating_number(seller_rating)
+        if rating_value is not None and rating_value > 0:
+            return self._build_review_info(
+                reviews_count=None,
+                seller_rating=seller_rating,
+                source=f"{source_label}:seller_rating",
+                offer_html=offer_html,
+            )
+
+        return self._build_review_info(
+            reviews_count=None,
+            seller_rating=seller_rating,
+            source=f"{source_label}:unknown",
+            offer_html=offer_html,
+        )
+
+    async def get_seller_review_info(
+        self,
+        offer_html: Optional[str],
+        offer_url: str,
+        stats: Optional[SearchStats],
+    ) -> dict:
+        if offer_html:
+            info = self._extract_seller_review_info_from_html(offer_html, source_label="offer_html")
+            if info["has_review_signal"] or info["has_no_reviews_signal"]:
+                return info
+
+        if offer_url and stats is not None:
+            logger.debug("[REVIEWS] Fallback fetch %s", offer_url)
+            fetched_html = await self._fetch(offer_url, stats, referer=f"{self.BASE_URL}/")
+            if fetched_html:
+                return self._extract_seller_review_info_from_html(fetched_html, source_label="offer_url")
+
+        return self._build_review_info(
+            reviews_count=None,
+            seller_rating=None,
+            source="unknown",
+            offer_html=offer_html or "",
+        )
+
+    async def check_offer(self, offer: dict, stats: SearchStats) -> dict:
+        offer_url = str(offer.get("url") or "")
+        offer_html = str(offer.get("offer_html") or "")
+        logger.debug("[DETAIL] Loading %s", offer_url)
+
+        if not offer_html:
+            offer_html = await self._fetch(offer_url, stats, referer=f"{self.BASE_URL}/")
+            if not offer_html:
+                logger.warning("[DETAIL] Empty response for %s", offer_url)
+                return self._empty_offer_details()
+            review_info = await self.get_seller_review_info(offer_html, "", stats)
+        else:
+            review_info = await self.get_seller_review_info(offer_html, offer_url, stats)
+
+        resolved_offer_html = str(review_info.get("offer_html") or offer_html)
+        if not resolved_offer_html:
+            logger.warning("[DETAIL] No HTML available after review fallbacks for %s", offer_url)
+            return self._empty_offer_details()
+
+        soup = BeautifulSoup(resolved_offer_html, "lxml")
         status = self._parse_seller_status_from_soup(soup)
         description = self._parse_description(soup)
         images = self._parse_images(soup)
         seller_name = self._parse_seller_name(soup)
         seller_type = self._parse_seller_type(soup)
-        seller_rating = self._parse_seller_rating_value(soup)
-        reviews_count, reviews_source, has_review_signal, has_no_reviews_signal = self._parse_reviews_info(
-            soup,
-            seller_rating,
-        )
         seller_debug = self._collect_seller_debug(soup)
 
         logger.debug(
             "[DETAIL] seller=%r type=%r rating=%r status=%r reviews=%r source=%s signal=%s no_reviews=%s desc=%d images=%d url=%s",
             seller_name,
             seller_type,
-            seller_rating,
+            review_info.get("seller_rating"),
             status,
-            reviews_count,
-            reviews_source,
-            "yes" if has_review_signal else "no",
-            "yes" if has_no_reviews_signal else "no",
+            review_info.get("reviews_count"),
+            review_info.get("reviews_source"),
+            "yes" if review_info.get("has_review_signal") else "no",
+            "yes" if review_info.get("has_no_reviews_signal") else "no",
             len(description),
             len(images),
-            url,
+            offer_url,
         )
         logger.info(
             "[SELLER] type=%r name=%r rating=%r reviews=%r reviews_source=%s review_signal=%s no_reviews=%s status=%r debug=%s",
             seller_type,
             seller_name,
-            seller_rating,
-            reviews_count,
-            reviews_source,
-            "yes" if has_review_signal else "no",
-            "yes" if has_no_reviews_signal else "no",
+            review_info.get("seller_rating"),
+            review_info.get("reviews_count"),
+            review_info.get("reviews_source"),
+            "yes" if review_info.get("has_review_signal") else "no",
+            "yes" if review_info.get("has_no_reviews_signal") else "no",
             status,
             seller_debug,
         )
@@ -527,14 +695,18 @@ class OLXParser:
             "last_online": status,
             "description": description,
             "images": images,
-            "reviews_count": reviews_count,
-            "reviews_source": reviews_source,
-            "has_review_signal": has_review_signal,
-            "has_no_reviews_signal": has_no_reviews_signal,
+            "reviews_count": review_info.get("reviews_count"),
+            "reviews_source": review_info.get("reviews_source"),
+            "has_review_signal": bool(review_info.get("has_review_signal")),
+            "has_no_reviews_signal": bool(review_info.get("has_no_reviews_signal")),
             "seller_name": seller_name,
             "seller_type": seller_type,
-            "seller_rating": seller_rating,
+            "seller_rating": review_info.get("seller_rating"),
+            "offer_html": resolved_offer_html,
         }
+
+    async def _fetch_listing_details(self, url: str, stats: SearchStats) -> dict:
+        return await self.check_offer({"url": url}, stats)
 
     def _parse_seller_status_from_soup(self, soup: BeautifulSoup) -> Optional[str]:
         status = self._extract_status_nextdata(soup)
@@ -1027,11 +1199,12 @@ class OLXParser:
     def _extract_reviews_count_from_texts(self, texts: list[str]) -> Optional[int]:
         for text in texts:
             normalized = self._normalize_match_text(text)
-            match = _REVIEWS_RE.search(normalized)
-            if match:
-                return int(match.group(1))
             if _NO_REVIEWS_RE.search(normalized):
                 return 0
+            for pattern in _REVIEW_TEXT_PATTERNS:
+                match = pattern.search(normalized)
+                if match:
+                    return int(match.group(1))
         return None
 
     def _has_generic_reviews_signal(self, texts: list[str]) -> bool:
@@ -1078,11 +1251,12 @@ class OLXParser:
                 text = self._normalize_match_text(element.get_text(" ", strip=True))
                 if not text:
                     continue
-                match = _REVIEWS_RE.search(text)
-                if match:
-                    return int(match.group(1))
                 if _NO_REVIEWS_RE.search(text):
                     return 0
+                for pattern in _REVIEW_TEXT_PATTERNS:
+                    match = pattern.search(text)
+                    if match:
+                        return int(match.group(1))
         return None
 
     def _extract_reviews_count_from_scripts(self, soup: BeautifulSoup) -> Optional[int]:
@@ -1269,7 +1443,7 @@ class OLXParser:
         seen_urls: set[str] = set()
 
         for page in range(1, max_pages + 1):
-            cards = await self._fetch_listings_page(
+            cards = await self.parse_page(
                 query,
                 page,
                 stats,
@@ -1324,7 +1498,7 @@ class OLXParser:
             title = listing.get("title", "(untitled)")[:60]
             logger.info("[CHECK] %d/%d title=%s", idx, total, title)
 
-            details = await self._fetch_listing_details(listing["url"], stats)
+            details = await self.check_offer(listing, stats)
             stats.listings_checked = idx
 
             online = self.is_online_today(details["last_online"])
