@@ -71,6 +71,7 @@ _BUSINESS_NAME_HINT_RE = re.compile(
     r"(?:www\.|\.ro\b|\bsrl\b|\bshop\b|\bstore\b|\boutlet\b|\bmarket\b|\bmagazin\b|\bamanet\b|\batelier\b|\bservice\b|\btelefon(?:e|ulor)?\b|\bproduse?\b|\bgradina\b|\bg[sz]m\b|\bprintlab\b|\boffroad\b)",
     re.IGNORECASE,
 )
+_SELLER_REVIEW_ATTR_RE = re.compile(r"(feedback|review|rating|reput|opinii|evaluari)", re.IGNORECASE)
 _VISIBLE_TEXT_SKIP_TAGS = {"script", "style", "noscript", "svg", "path", "meta", "link", "head", "title"}
 _SELLER_BLOCK_HINTS = ("seller", "user", "profile", "contact", "owner", "account")
 _SELLER_NAME_EXCLUDE_PREFIXES = (
@@ -897,6 +898,21 @@ class OLXParser:
                     return rating
         return None
 
+    @staticmethod
+    def _extract_rating_number(value: Optional[str]) -> Optional[float]:
+        if value is None:
+            return None
+        cleaned = str(value).replace(",", ".").strip()
+        if not cleaned:
+            return None
+        try:
+            numeric = float(cleaned)
+        except ValueError:
+            return None
+        if 0 <= numeric <= 5:
+            return numeric
+        return None
+
     def _collect_seller_texts(self, soup: BeautifulSoup) -> list[str]:
         snippets: list[str] = []
         for text in self._collect_seller_context_texts(soup, limit=120):
@@ -914,6 +930,8 @@ class OLXParser:
                     "rating",
                     "review",
                     "evaluari",
+                    "opinii",
+                    "reput",
                     "feedback",
                     "olx din",
                     "activ azi",
@@ -1001,10 +1019,8 @@ class OLXParser:
         if count is not None:
             return count, "seller_text", count > 0, count == 0
 
-        if self._has_generic_reviews_signal(seller_texts):
-            return None, "seller_text_signal", True, False
-
-        if seller_rating:
+        rating_value = self._extract_rating_number(seller_rating)
+        if rating_value is not None and rating_value > 0:
             return None, "seller_rating", True, False
         return None, "unknown", False, False
 
@@ -1027,8 +1043,24 @@ class OLXParser:
                 token in normalized
                 for token in ("ratinguri", "review", "reviews", "recenzii", "evaluari", "opinii")
             ):
-                return True
+                    return True
         return False
+
+    @staticmethod
+    def _element_has_review_hint(element: Any) -> bool:
+        if not getattr(element, "attrs", None):
+            return False
+
+        values: list[str] = []
+        for attr_name in ("data-testid", "id", "class"):
+            raw = element.get(attr_name)
+            if isinstance(raw, list):
+                values.extend(str(item) for item in raw)
+            elif raw:
+                values.append(str(raw))
+        if not values:
+            return False
+        return bool(_SELLER_REVIEW_ATTR_RE.search(" ".join(values)))
 
     def _extract_reviews_count_nextdata(self, soup: BeautifulSoup) -> Optional[int]:
         data = self._get_nextdata(soup)
@@ -1042,7 +1074,7 @@ class OLXParser:
 
     def _extract_reviews_count_from_review_nodes(self, soup: BeautifulSoup) -> Optional[int]:
         for block in self._iter_seller_blocks(soup):
-            for element in block.find_all(attrs={"data-testid": re.compile(r"(review|rating|feedback)", re.IGNORECASE)}):
+            for element in block.find_all(self._element_has_review_hint):
                 text = self._normalize_match_text(element.get_text(" ", strip=True))
                 if not text:
                     continue
@@ -1148,19 +1180,17 @@ class OLXParser:
         has_no_reviews_signal: bool = False,
         has_review_signal: bool = False,
     ) -> bool:
+        rating_value = OLXParser._extract_rating_number(seller_rating)
         has_reviews = (
             (reviews_count is not None and reviews_count > 0)
-            or bool((seller_rating or "").strip())
+            or bool(rating_value and rating_value > 0)
             or has_review_signal
         )
+        has_no_reviews = (reviews_count == 0) or has_no_reviews_signal
         if review_filter == "with":
             return has_reviews
         if review_filter == "without":
-            if has_reviews:
-                return False
-            if has_no_reviews_signal:
-                return True
-            return reviews_count in (None, 0)
+            return has_no_reviews and not has_reviews
         return True
 
     @classmethod
