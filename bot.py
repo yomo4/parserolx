@@ -4,8 +4,10 @@ Telegram bot for OLX.ro parsing with subscriptions, admin tools, and inline UI.
 
 import asyncio
 import logging
+import os
 import time
 from html import escape
+from pathlib import Path
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
@@ -42,6 +44,62 @@ parser = OLXParser()
 db = BotDatabase(config.DB_PATH)
 SEARCH_SEMAPHORE = asyncio.Semaphore(getattr(config, "MAX_CONCURRENT_SEARCHES", 3))
 ACTIVE_SEARCH_TASKS: dict[int, asyncio.Task] = {}
+
+
+class SingleInstanceLock:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._handle = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.path.open("a+", encoding="utf-8")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._handle.close()
+            self._handle = None
+            return False
+
+        self._handle.seek(0)
+        self._handle.truncate()
+        self._handle.write(str(os.getpid()))
+        self._handle.flush()
+        return True
+
+    def release(self) -> None:
+        if not self._handle:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            self._handle.close()
+        finally:
+            self._handle = None
+
+
+def _polling_lock_path() -> Path:
+    db_path = Path(config.DB_PATH)
+    if not db_path.is_absolute():
+        db_path = Path.cwd() / db_path
+    return db_path.parent / "bot.polling.lock"
 
 
 REVIEW_FILTER_LABELS = {
@@ -1472,7 +1530,32 @@ async def _show_search_result(
             _build_completion_text(query, settings, stats, found=0),
             parse_mode="HTML",
         )
-        if skipped_seen:
+        if getattr(stats, "protection_hits", 0):
+            await message.answer(
+                "\n\n".join(
+                    [
+                        "🛡️ <b>OLX временно заблокировал выдачу</b>",
+                        _build_block(
+                            "Что произошло",
+                            [
+                                "Сайт вернул protection page вместо обычных объявлений.",
+                                f"Срабатываний защиты: <b>{stats.protection_hits}</b>",
+                                "Это не означает, что объявлений по сценарию нет.",
+                            ],
+                        ),
+                        _build_block(
+                            "Что делать",
+                            [
+                                "Обновить cookies OLX в источнике cookies.",
+                                "Запустить бота с другого IP или через прокси `OLX_PROXY_URL`.",
+                                "Проверить, что с тем же токеном не работает второй экземпляр бота.",
+                            ],
+                        ),
+                    ]
+                ),
+                parse_mode="HTML",
+            )
+        elif skipped_seen:
             await message.answer(
                 "\n\n".join(
                     [
@@ -1654,6 +1737,11 @@ def _build_completion_text(query: str, settings: dict, stats, found: int) -> str
                 f"Проверено объявлений: <b>{stats.listings_checked}</b>",
                 f"Страниц поиска: <b>{stats.pages_loaded}</b>",
                 f"Запросов к OLX: <b>{stats.requests_made}</b>",
+                (
+                    f"Срабатываний защиты OLX: <b>{stats.protection_hits}</b>"
+                    if getattr(stats, "protection_hits", 0)
+                    else None
+                ),
                 f"Время: <b>{stats.elapsed:.1f} сек.</b>",
             ],
             expandable=True,
@@ -1803,10 +1891,23 @@ async def on_shutdown(dispatcher: Dispatcher) -> None:
 
 
 async def main() -> None:
+    instance_lock = SingleInstanceLock(_polling_lock_path())
+    if not instance_lock.acquire():
+        logger.error("Another bot instance is already polling for this token. Exiting.")
+        return
+
     dp.shutdown.register(on_shutdown)
-    await _configure_bot_presentation()
-    logger.info("Bot started")
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    try:
+        try:
+            await bot.delete_webhook(drop_pending_updates=False)
+        except Exception:
+            logger.exception("Failed to delete webhook before polling")
+
+        await _configure_bot_presentation()
+        logger.info("Bot started")
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        instance_lock.release()
 
 
 if __name__ == "__main__":

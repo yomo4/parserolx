@@ -122,6 +122,7 @@ class SearchStats:
     category_path: str = ""
     city_filter: str = ""
     requests_made: int = 0
+    protection_hits: int = 0
     pages_loaded: int = 0
     listings_seen: int = 0
     listings_checked: int = 0
@@ -154,18 +155,35 @@ class OLXParser:
         normalized = re.sub(r"\s+", "-", query.strip())
         return quote(normalized, safe="")
 
-    def _build_search_url(self, query: str, page: int, category_path: str = "") -> str:
+    @staticmethod
+    def _build_path_slug(value: str) -> str:
+        normalized = unicodedata.normalize("NFKD", value or "")
+        ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+        cleaned = re.sub(r"[^a-zA-Z0-9]+", "-", ascii_text).strip("-").lower()
+        return cleaned
+
+    def _build_search_url(
+        self,
+        query: str,
+        page: int,
+        category_path: str = "",
+        city_filter: str = "",
+    ) -> str:
         normalized_path = category_path.strip("/")
+        city_slug = self._build_path_slug(city_filter) if normalized_path and city_filter.strip() else ""
+        base_path = f"{self.BASE_URL}/{normalized_path}/" if normalized_path else f"{self.BASE_URL}/"
+        if city_slug:
+            base_path = f"{self.BASE_URL}/{normalized_path}/{city_slug}/"
         cleaned_query = query.strip()
         if cleaned_query:
             slug = self._build_search_slug(cleaned_query)
             if normalized_path:
-                url = f"{self.BASE_URL}/{normalized_path}/q-{slug}/"
+                url = f"{base_path}q-{slug}/"
             else:
                 url = self.SEARCH_URL.format(query=slug)
         else:
             if normalized_path:
-                url = f"{self.BASE_URL}/{normalized_path}/"
+                url = base_path
             else:
                 url = f"{self.BASE_URL}/oferte/"
         if page > 1:
@@ -325,6 +343,7 @@ class OLXParser:
         if response.status_code == 200:
             text = response.text
             if self._looks_like_protection_page(text):
+                stats.protection_hits += 1
                 logger.warning("CURL protection page detected | %s", url)
                 return None
             logger.debug("CURL ok | bytes=%d | %s", len(text), url)
@@ -350,6 +369,7 @@ class OLXParser:
                     if response.status == 200:
                         text = await response.text()
                         if self._looks_like_protection_page(text):
+                            stats.protection_hits += 1
                             logger.warning(
                                 "HTTP protection page | attempt=%d elapsed=%.2fs | %s",
                                 attempt,
@@ -399,7 +419,12 @@ class OLXParser:
         stats: SearchStats,
         category_path: str = "",
     ) -> list[dict]:
-        url = self._build_search_url(query, page, category_path)
+        url = self._build_search_url(
+            query,
+            page,
+            category_path,
+            city_filter=stats.city_filter,
+        )
         logger.info("[SEARCH] Page %d url=%s", page, url)
 
         html = await self._fetch(url, stats, referer=f"{self.BASE_URL}/")
